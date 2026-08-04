@@ -10,10 +10,17 @@ import 'asr.dart';
 import 'db.dart';
 import 'security.dart';
 
-/// Kiểm tra video YouTube có CHO PHÉP NHÚNG không (qua oembed).
-/// 200 = nhúng được; 401/403/404 = chặn/private/không tồn tại.
-/// Lỗi mạng → trả `null` (không kết luận được, để caller tự quyết).
-Future<bool?> _youtubeEmbeddable(String id) async {
+/// oEmbed YouTube: vừa kiểm tra CHO PHÉP NHÚNG, vừa lấy TIÊU ĐỀ + KÊNH.
+/// ok=true (nhúng được, kèm title/author) · ok=false (private/tắt nhúng) ·
+/// ok=null (lỗi mạng — không kết luận được, để caller tự quyết).
+class YtInfo {
+  final bool? ok;
+  final String? title;
+  final String? author;
+  const YtInfo(this.ok, [this.title, this.author]);
+}
+
+Future<YtInfo> _youtubeInfo(String id) async {
   HttpClient? client;
   try {
     client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
@@ -21,10 +28,55 @@ Future<bool?> _youtubeEmbeddable(String id) async {
         'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$id&format=json');
     final req = await client.getUrl(uri);
     final resp = await req.close();
-    await resp.drain<void>();
-    return resp.statusCode == 200;
+    if (resp.statusCode != 200) {
+      await resp.drain<void>();
+      return const YtInfo(false);
+    }
+    final body = await resp.transform(utf8.decoder).join();
+    final j = jsonDecode(body) as Map<String, dynamic>;
+    return YtInfo(true, (j['title'] as String?)?.trim(),
+        (j['author_name'] as String?)?.trim());
   } catch (_) {
-    return null; // mạng lỗi — không chặn
+    return const YtInfo(null); // mạng lỗi — không chặn
+  } finally {
+    client?.close(force: true);
+  }
+}
+
+/// Giữ API cũ: chỉ cần biết nhúng được hay không.
+Future<bool?> _youtubeEmbeddable(String id) async => (await _youtubeInfo(id)).ok;
+
+/// Liệt kê videoId trong 1 playlist YouTube qua Data API v3 (cần biến môi
+/// trường YOUTUBE_API_KEY). Trả null nếu thiếu key; ném String nếu API lỗi
+/// (key sai, playlist private...).
+Future<List<String>?> _playlistVideoIds(String playlistId) async {
+  final key = Platform.environment['YOUTUBE_API_KEY'];
+  if (key == null || key.isEmpty) return null;
+  final out = <String>[];
+  String? pageToken;
+  HttpClient? client;
+  try {
+    client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    for (var page = 0; page < 8; page++) {
+      // tối đa ~400 video/playlist
+      final uri = Uri.parse('https://www.googleapis.com/youtube/v3/playlistItems'
+          '?part=contentDetails&maxResults=50&playlistId=$playlistId&key=$key'
+          '${pageToken != null ? '&pageToken=$pageToken' : ''}');
+      final req = await client.getUrl(uri);
+      final resp = await req.close();
+      final body = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) {
+        throw 'YouTube API lỗi ${resp.statusCode} (kiểm tra YOUTUBE_API_KEY và playlist có công khai không)';
+      }
+      final j = jsonDecode(body) as Map<String, dynamic>;
+      for (final it in (j['items'] as List? ?? const [])) {
+        final vid = ((it as Map)['contentDetails'] as Map?)?['videoId'];
+        if (vid is String && vid.length == 11) out.add(vid);
+      }
+      pageToken = j['nextPageToken'] as String?;
+      if (pageToken == null) break;
+    }
+    return out;
   } finally {
     client?.close(force: true);
   }
@@ -1416,6 +1468,109 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       db.addVideoToPlaylist(pid, id);
     }
     return ok(videoJson(db.video(id)!));
+  });
+
+  // THÊM NHANH hàng loạt: dán 1 đoạn text chứa nhiều link video YouTube
+  // và/hoặc link playlist — server tự nhận diện, tự lấy TIÊU ĐỀ + KÊNH qua
+  // oEmbed, kiểm tra nhúng được, bỏ trùng, rồi thêm tất cả (official).
+  // body: {text, level?, playlistId?} → {added:[{id,youtubeId,title}...],
+  //        skipped:[{youtubeId?,item?,reason}...]}
+  r.post('/admin/videos/bulk', (Request req) async {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    final b = await readJson(req);
+    final text = ((b['text'] as String?) ?? '').trim();
+    if (text.isEmpty) return bad('Dán ít nhất 1 link YouTube');
+    if (text.length > 20000) return bad('Nội dung dán quá dài');
+    final level = ((b['level'] as String?) ?? 'N5').trim();
+    final pid = b['playlistId'];
+
+    final videoRe = RegExp(
+        r'(?:youtu\.be/|watch\?v=|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{11})');
+    final bareIdRe = RegExp(r'^[A-Za-z0-9_-]{11}$');
+    final playlistRe = RegExp(r'[?&]list=([A-Za-z0-9_-]{10,})');
+
+    final ids = <String>[]; // giữ thứ tự dán
+    final skipped = <Map<String, dynamic>>[];
+    void addId(String id) {
+      if (!ids.contains(id)) ids.add(id);
+    }
+
+    // Tách theo dòng/khoảng trắng/phẩy — mỗi token 1 link hoặc 1 ID.
+    for (final tokRaw in text.split(RegExp(r'[\s,]+'))) {
+      final tok = tokRaw.trim();
+      if (tok.isEmpty) continue;
+      final vm = videoRe.firstMatch(tok);
+      if (vm != null) {
+        addId(vm.group(1)!);
+        continue; // link watch?v=..&list=.. → ưu tiên video, không kéo cả list
+      }
+      final pm = playlistRe.firstMatch(tok);
+      if (pm != null) {
+        // Link playlist thuần → kéo toàn bộ video trong đó (cần API key).
+        try {
+          final listIds = await _playlistVideoIds(pm.group(1)!);
+          if (listIds == null) {
+            skipped.add({
+              'item': tok,
+              'reason':
+                  'Nhập playlist cần đặt YOUTUBE_API_KEY trên server (Google Cloud → YouTube Data API v3)'
+            });
+          } else if (listIds.isEmpty) {
+            skipped.add({'item': tok, 'reason': 'Playlist rỗng hoặc không đọc được'});
+          } else {
+            listIds.forEach(addId);
+          }
+        } catch (e) {
+          skipped.add({'item': tok, 'reason': '$e'});
+        }
+        continue;
+      }
+      if (bareIdRe.hasMatch(tok)) {
+        addId(tok);
+        continue;
+      }
+      skipped.add({'item': tok, 'reason': 'Không nhận diện được link/ID'});
+    }
+    if (ids.length > 200) {
+      skipped.add({'item': '...', 'reason': 'Chỉ nhận tối đa 200 video/lần — phần dư bị bỏ'});
+      ids.removeRange(200, ids.length);
+    }
+
+    // Lấy metadata + thêm — chạy song song từng nhóm 6 cho nhanh.
+    final added = <Map<String, dynamic>>[];
+    for (var i = 0; i < ids.length; i += 6) {
+      final chunk = ids.sublist(i, i + 6 > ids.length ? ids.length : i + 6);
+      await Future.wait(chunk.map((ytId) async {
+        if (db.officialVideoExists(ytId)) {
+          skipped.add({'youtubeId': ytId, 'reason': 'Đã có trong thư viện'});
+          return;
+        }
+        final info = await _youtubeInfo(ytId);
+        if (info.ok == false) {
+          skipped.add({
+            'youtubeId': ytId,
+            'reason': 'Không nhúng được (private/tắt embed)'
+          });
+          return;
+        }
+        final title = (info.title?.isNotEmpty == true) ? info.title! : ytId;
+        final id = db.createVideo(
+          title: title,
+          channel:
+              (info.author?.isNotEmpty == true) ? info.author! : 'XS GO',
+          level: level,
+          youtubeId: ytId,
+          ownerUserId: null,
+          official: true,
+        );
+        if (pid is int && db.playlistExists(pid)) {
+          db.addVideoToPlaylist(pid, id);
+        }
+        added.add({'id': id, 'youtubeId': ytId, 'title': title});
+      }));
+    }
+    return ok({'added': added, 'skipped': skipped});
   });
 
   // Sửa video (tiêu đề/level/official/ẩn) — áp cho MỌI video.

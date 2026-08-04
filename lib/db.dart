@@ -715,6 +715,14 @@ class Db {
     _db.execute('DELETE FROM vocab WHERE user_id = ? AND id = ?', [userId, id]);
   }
 
+  /// Đã có video OFFICIAL với youtubeId này chưa (chặn thêm trùng hàng loạt).
+  bool officialVideoExists(String youtubeId) {
+    final r = _db.select(
+        'SELECT 1 FROM videos WHERE youtube_id = ? AND is_official = 1 LIMIT 1',
+        [youtubeId]);
+    return r.isNotEmpty;
+  }
+
   /// Tạo video người dùng thêm (YouTube). Kèm 1 câu placeholder để màn Study
   /// hoạt động; phụ đề AI (ASR) là tính năng sau.
   int createVideo({
