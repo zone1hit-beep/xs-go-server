@@ -1,0 +1,17 @@
+# Không copy dữ liệu/rác local vào build context & image.
+.dart_tool/
+.git/
+.gitignore
+# DB local + WAL (KHÔNG bao giờ ship dữ liệu dev lên image — DB thật nằm ở volume /data)
+xs_go.db
+xs_go.db-shm
+xs_go.db-wal
+*.db
+*.db-shm
+*.db-wal
+# Tài liệu / hạ tầng không cần trong image
+DEPLOY.md
+README.md
+fly.toml
+Dockerfile
+.dockerignore

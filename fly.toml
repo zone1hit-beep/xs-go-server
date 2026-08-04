@@ -1,0 +1,29 @@
+# fly.toml app configuration file generated for xs-go-server on 2026-07-26T19:40:05+09:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'xs-go-server'
+primary_region = 'sin'
+
+[build]
+[env]
+  PORT = '8091'
+  XSGO_DB = '/data/xs_go.db'
+
+[[mounts]]
+  source = 'data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8091
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+  cpus = 1
+  memory_mb = 256
