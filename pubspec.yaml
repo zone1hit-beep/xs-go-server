@@ -11,6 +11,8 @@ dependencies:
   shelf_router: ^1.1.4
   sqlite3: ^2.4.0
   crypto: ^3.0.3
+  http: ^1.2.0
+  dart_jsonwebtoken: ^2.14.0
 
 dev_dependencies:
   lints: ^4.0.0

@@ -177,4 +177,130 @@ void main() {
       alignTokenTimings(<Map<String, dynamic>>[], '', const []); // không ném lỗi
     });
   });
+
+  group('ngắt câu theo dấu câu ở GIỮA từ (lỗi phụ đề dính 2 câu)', () {
+    test('"です。それで" bị tách thành 2 dòng riêng', () {
+      final data = {
+        'events': [
+          {
+            'tStartMs': 0,
+            'segs': [
+              {'utf8': 'おはよう', 'tOffsetMs': 0},
+              {'utf8': 'ございます。それでは', 'tOffsetMs': 300},
+              {'utf8': '始めます', 'tOffsetMs': 900},
+            ],
+          },
+        ],
+      };
+      final out = parseJson3Captions(data);
+      expect(out.length, greaterThanOrEqualTo(2),
+          reason: 'dấu 。 ở giữa từ phải cắt sang dòng mới');
+      expect(out.first['text'], contains('。'));
+      // Câu sau KHÔNG được chứa phần trước dấu chấm.
+      expect(out[1]['text'], isNot(contains('ございます')));
+    });
+
+    test('không có dấu câu ở giữa thì giữ nguyên từ', () {
+      final data = {
+        'events': [
+          {
+            'tStartMs': 0,
+            'segs': [
+              {'utf8': 'これは', 'tOffsetMs': 0},
+              {'utf8': 'ペンです', 'tOffsetMs': 200},
+            ],
+          },
+        ],
+      };
+      final out = parseJson3Captions(data);
+      expect(out.length, 1);
+      expect(out.first['text'], 'これはペンです');
+    });
+
+    test('dòng phụ đề không quá dài (trần mềm ~26 chữ)', () {
+      final segs = <Map<String, dynamic>>[];
+      for (var i = 0; i < 30; i++) {
+        segs.add({'utf8': 'あい', 'tOffsetMs': i * 200});
+      }
+      final out = parseJson3Captions({
+        'events': [
+          {'tStartMs': 0, 'segs': segs}
+        ]
+      });
+      for (final s in out) {
+        expect((s['text'] as String).length, lessThanOrEqualTo(30),
+            reason: 'dòng "${s['text']}" quá dài');
+      }
+    });
+  });
+
+  group('NGẮT THEO NHỊP ĐỌC (lỗi: cắt cứng giữa chừng, tách đuôi ます)', () {
+    /// Dựng caption liền mạch: các từ cách nhau [gapMs] (không có chỗ nghỉ).
+    Map<String, dynamic> run(List<String> texts, {int gapMs = 220}) => {
+          'events': [
+            {
+              'tStartMs': 0,
+              'segs': [
+                for (var i = 0; i < texts.length; i++)
+                  {'utf8': texts[i], 'tOffsetMs': i * gapMs},
+              ],
+            },
+          ],
+        };
+
+    test('KHÔNG tách đuôi「ます」khỏi thân động từ', () {
+      // Câu dài liền mạch, phải chia — nhưng không được chia ngay trước ます.
+      final out = parseJson3Captions(run([
+        'それでは', '今日', 'の', 'ニュース', 'を',
+        '始め', 'ます', 'ので', 'よろしく', 'お願い', 'し', 'ます',
+      ]));
+      expect(out.length, greaterThan(1), reason: 'câu dài phải được chia');
+      for (final s in out) {
+        final t = s['text'] as String;
+        expect(t.startsWith('ます'), isFalse,
+            reason: 'dòng "$t" bắt đầu bằng đuôi ます → đã tách khỏi thân từ');
+        expect(t.startsWith('ました'), isFalse, reason: 'dòng "$t"');
+        expect(t.startsWith('です'), isFalse, reason: 'dòng "$t"');
+      }
+    });
+
+    test('ngắt ĐÚNG chỗ người nói nghỉ (nghỉ dài giữa câu)', () {
+      final out = parseJson3Captions({
+        'events': [
+          {
+            'tStartMs': 0,
+            'segs': [
+              {'utf8': 'これは', 'tOffsetMs': 0},
+              {'utf8': 'ペンです', 'tOffsetMs': 250},
+              // nghỉ 1,2 giây = ngắt ý rõ ràng
+              {'utf8': 'それから', 'tOffsetMs': 1450},
+              {'utf8': 'ノートも', 'tOffsetMs': 1700},
+            ],
+          },
+        ],
+      });
+      expect(out.length, 2, reason: 'phải ngắt đúng tại chỗ nghỉ 1,2s');
+      expect(out[0]['text'], 'これはペンです');
+      expect(out[1]['text'], 'それからノートも');
+    });
+
+    test('câu ngắn liền mạch KHÔNG bị chia vụn', () {
+      final out = parseJson3Captions(run(['今日', 'は', 'いい', '天気']));
+      expect(out.length, 1, reason: 'câu ngắn không có lý do gì để cắt');
+      expect(out.first['text'], '今日はいい天気');
+    });
+
+    test('ưu tiên cắt SAU hết vế câu thay vì giữa vế', () {
+      // Đủ dài để BUỘC phải chia (>26 chữ), có ranh giới vế rõ ở ました.
+      final out = parseJson3Captions(run([
+        '昨日', 'は', '会社', 'に', '行き', 'ました',
+        'それから', '友達', 'と', '晩ご飯', 'を', '食べ', 'ました',
+      ]));
+      expect(out.length, greaterThan(1),
+          reason: 'câu ${out.map((e) => e['text']).toList()} phải được chia');
+      // Dòng đầu nên kết thúc trọn vẹn ở ました (hết vế), không đứt giữa chừng.
+      expect((out.first['text'] as String).endsWith('ました'), isTrue,
+          reason: 'dòng đầu "${out.first['text']}" phải hết ở ranh giới vế câu');
+    });
+  });
 }

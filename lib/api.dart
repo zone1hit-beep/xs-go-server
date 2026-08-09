@@ -9,6 +9,7 @@ import 'ai.dart';
 import 'asr.dart';
 import 'db.dart';
 import 'security.dart';
+import 'social_auth.dart';
 
 /// oEmbed YouTube: vừa kiểm tra CHO PHÉP NHÚNG, vừa lấy TIÊU ĐỀ + KÊNH.
 /// ok=true (nhúng được, kèm title/author) · ok=false (private/tắt nhúng) ·
@@ -288,6 +289,83 @@ Future<List<Map<String, dynamic>>> _fetchYoutubeCaptions(String ytId) async {
 /// - `dDurationMs` của các event CHỒNG LẤN nhau → KHÔNG dùng để tính kết thúc.
 /// - Các event là mảnh vụn cắt giữa câu (`てい` + `ます…`) → gộp lại thành câu
 ///   trọn vẹn theo dấu câu 。！？ (hoặc khi quá dài) cho dễ học.
+
+
+/// Đuôi KẾT THÚC VẾ CÂU — cắt NGAY SAU chúng nghe rất tự nhiên.
+final _endTail = RegExp(
+    r'(ます|ました|ません|ませんでした|でした|です|だった|ください|'
+    r'ましょう|でしょう|ですね|ますね|ますが|た|る|よ|ね|な)$');
+
+/// Đuôi NỐI VẾ — cắt sau chúng chấp nhận được (nghỉ ngắn giữa câu).
+final _joinTail = RegExp(r'(て|で|が|けど|けれど|から|ので|のに|し|たら|ば|と)$');
+
+/// Mảnh MỞ ĐẦU bằng đuôi động từ — TUYỆT ĐỐI không cắt ngay trước nó, vì sẽ
+/// tách đuôi khỏi thân từ (vd 「始め | ます」) — đây chính là lỗi làm phụ đề
+/// lệch nhịp đọc.
+final _startTail = RegExp(
+    r'^(ます|ました|ません|ませんでした|でした|です|ている|ています|'
+    r'ていました|た|て|られ|させ|そう|ながら)');
+
+/// Chia một cụm từ liền mạch (không có chỗ nghỉ) thành các dòng phụ đề, cắt ở
+/// điểm TỰ NHIÊN nhất: ưu tiên khoảng nghỉ dài nhất + ranh giới vế câu, và
+/// tránh cắt vào giữa một từ đang chia đuôi.
+List<List<Map<String, dynamic>>> _splitRunNaturally(
+    List<Map<String, dynamic>> run, int maxChars, int maxSpanMs) {
+  final chars = run.fold<int>(0, (a, w) => a + (w['text'] as String).length);
+  final span = (run.last['tMs'] as int) - (run.first['tMs'] as int);
+  if (run.length < 2 || (chars <= maxChars && span <= maxSpanMs)) {
+    return [run];
+  }
+
+  var bestAt = -1;
+  var bestScore = -1 << 30;
+  var before = (run.first['text'] as String).length;
+  for (var i = 1; i < run.length; i++) {
+    final prev = run[i - 1]['text'] as String;
+    final next = run[i]['text'] as String;
+    final gap = (run[i]['tMs'] as int) - (run[i - 1]['tMs'] as int);
+    final after = chars - before;
+
+    var score = gap; // nghỉ càng dài, cắt càng hợp tai
+    if (_endTail.hasMatch(prev)) score += 1500; // hết một vế câu
+    if (_joinTail.hasMatch(prev)) score += 600; // nối vế, nghỉ nhẹ
+    if (_startTail.hasMatch(next)) score -= 3000; // ĐỪNG tách đuôi khỏi thân
+    // Ưu tiên chia cân đối để không ra dòng 2 chữ.
+    score -= ((before - after).abs() * 8);
+    // Tránh cắt sát đầu/cuối cụm.
+    if (before < 4 || after < 4) score -= 2000;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestAt = i;
+    }
+    before += next.length;
+  }
+
+  if (bestAt <= 0) return [run];
+  return [
+    ..._splitRunNaturally(run.sublist(0, bestAt), maxChars, maxSpanMs),
+    ..._splitRunNaturally(run.sublist(bestAt), maxChars, maxSpanMs),
+  ];
+}
+
+/// Tách một chuỗi caption thành các mảnh KẾT THÚC bằng dấu câu tiếng Nhật.
+/// "です。それで" → ["です。", "それで"]. Không có dấu câu ở giữa → trả nguyên.
+List<String> _splitAfterPunct(String t) {
+  final out = <String>[];
+  final buf = StringBuffer();
+  for (var i = 0; i < t.length; i++) {
+    final ch = t[i];
+    buf.write(ch);
+    if ('。．！？!?'.contains(ch) && i < t.length - 1) {
+      out.add(buf.toString());
+      buf.clear();
+    }
+  }
+  if (buf.isNotEmpty) out.add(buf.toString());
+  return out.isEmpty ? [t] : out;
+}
+
 ///
 /// Trả list: `{startMs, endMs, text, words: [{tMs, text}]}`.
 List<Map<String, dynamic>> parseJson3Captions(Map<String, dynamic> data) {
@@ -309,7 +387,26 @@ List<Map<String, dynamic>> parseJson3Captions(Map<String, dynamic> data) {
       // 'seq' = thứ tự xuất hiện — khóa phụ khi sort để KHÔNG đảo chữ lúc
       // 2 từ trùng mốc thời gian (List.sort của Dart không ổn định với list
       // >32 phần tử; trùng mốc là có thật vì các event json3 chồng lấn nhau).
-      words.add({'tMs': base + off, 'text': t, 'seq': words.length});
+      // TÁCH TỪ CHỨA DẤU KẾT CÂU Ở GIỮA. Caption hay gộp kiểu "です。それで"
+      // — nếu để nguyên thì bước gom câu (chỉ ngắt khi dấu câu ở CUỐI từ)
+      // sẽ dính 2 câu vào một dòng, đọc rất mệt. Chia mốc thời gian theo tỉ
+      // lệ ký tự để mảnh sau vẫn khớp giọng đọc.
+      final parts = _splitAfterPunct(t);
+      if (parts.length == 1) {
+        words.add({'tMs': base + off, 'text': t, 'seq': words.length});
+      } else {
+        // Ước lượng độ dài từ này: tới từ kế trong cùng event, hoặc 400ms.
+        var acc = 0;
+        for (final part in parts) {
+          final shift = (400 * acc / t.length).round();
+          words.add({
+            'tMs': base + off + shift,
+            'text': part,
+            'seq': words.length
+          });
+          acc += part.length;
+        }
+      }
     }
   }
   if (words.isEmpty) return const [];
@@ -318,53 +415,60 @@ List<Map<String, dynamic>> parseJson3Captions(Map<String, dynamic> data) {
     return c != 0 ? c : (a['seq'] as int).compareTo(b['seq'] as int);
   });
 
-  // 2) Gộp từ thành CÂU/DÒNG phụ đề.
-  //    ⚠️ Auto-caption tiếng Nhật KHÔNG có dấu câu → không thể chỉ dựa vào 。！？.
-  //    Ngưỡng dưới đây ĐO TỪ DỮ LIỆU THẬT (1531 từ): khoảng cách giữa 2 từ liền
-  //    mạch p50=360ms, p80=600ms; nghỉ thật (ngắt ý) ≥800ms → ~7 từ/dòng, đúng
-  //    độ dài một dòng phụ đề dễ đọc.
-  const maxChars = 32; // dòng phụ đề tiếng Nhật dễ đọc ~20-32 chữ
-  const maxSpanMs = 7000; // không để 1 dòng dài quá 7s
+  // 2) Gộp từ thành CÂU/DÒNG phụ đề — NGẮT THEO NHỊP NGHỈ CỦA GIỌNG ĐỌC.
+  //
+  //    Nguyên tắc: dòng phụ đề phải trùng với chỗ người nói NGHỈ, không được
+  //    cắt cứng theo số chữ. Cắt giữa chừng (vd tách đuôi「ます」khỏi động từ)
+  //    làm người học đọc theo bị hụt và chữ nhảy sai nhịp.
+  //    Ngưỡng đo từ dữ liệu thật (1531 từ): 2 từ liền mạch cách nhau p50=360ms,
+  //    p80=600ms → nghỉ ≥800ms là ngắt ý thật.
   const gapMs = 800; // nghỉ ≥0,8s = ngắt ý → sang dòng mới
+  // Trần MỀM: vượt thì đi tìm chỗ ngắt tự nhiên nhất bên trong, KHÔNG chặt ngay.
+  const softMaxChars = 26;
+  const softMaxSpanMs = 6500;
+
   final sentences = <Map<String, dynamic>>[];
+
+  // Gom thô: chỉ ngắt ở chỗ NGHỈ THẬT hoặc sau dấu kết câu.
+  final runs = <List<Map<String, dynamic>>>[];
   var cur = <Map<String, dynamic>>[];
-  var curChars = 0;
-
-  void flush() {
-    if (cur.isEmpty) return;
-    final text = cur.map((w) => w['text'] as String).join();
-    if (text.trim().isNotEmpty) {
-      sentences.add({
-        'startMs': cur.first['tMs'],
-        // endMs tạm = mốc từ cuối; sẽ chỉnh lại bằng mốc câu kế ở bước 3.
-        'endMs': cur.last['tMs'],
-        'text': text,
-        'words': List<Map<String, dynamic>>.from(cur),
-      });
-    }
-    cur = [];
-    curChars = 0;
-  }
-
-  for (var i = 0; i < words.length; i++) {
-    final w = words[i];
-    if (cur.isNotEmpty) {
-      final gap = (w['tMs'] as int) - (cur.last['tMs'] as int);
-      final span = (w['tMs'] as int) - (cur.first['tMs'] as int);
-      if (gap >= gapMs || span >= maxSpanMs || curChars >= maxChars) flush();
+  for (final w in words) {
+    if (cur.isNotEmpty &&
+        (w['tMs'] as int) - (cur.last['tMs'] as int) >= gapMs) {
+      runs.add(cur);
+      cur = [];
     }
     cur.add(w);
-    curChars += (w['text'] as String).length;
-    // Ngắt câu ngay sau dấu kết câu tiếng Nhật.
-    if (RegExp(r'[。．！？!?]$').hasMatch(w['text'] as String)) flush();
+    if (RegExp(r'[。．！？!?]$').hasMatch(w['text'] as String)) {
+      runs.add(cur);
+      cur = [];
+    }
   }
-  flush();
+  if (cur.isNotEmpty) runs.add(cur);
+
+  // Cụm quá dài (người nói liền một mạch) → chia tại điểm TỰ NHIÊN nhất.
+  for (final run in runs) {
+    for (final piece in _splitRunNaturally(run, softMaxChars, softMaxSpanMs)) {
+      final text = piece.map((w) => w['text'] as String).join();
+      if (text.trim().isEmpty) continue;
+      sentences.add({
+        'startMs': piece.first['tMs'],
+        // endMs tạm = mốc từ cuối; sẽ chỉnh lại bằng mốc câu kế ở bước 3.
+        'endMs': piece.last['tMs'],
+        'text': text,
+        'words': List<Map<String, dynamic>>.from(piece),
+      });
+    }
+  }
+
+  const maxChars = softMaxChars; // dùng lại cho bước gộp dòng vụn bên dưới
+  const maxSpanMs = softMaxSpanMs;
 
   // 2b) GỘP DÒNG VỤN: auto-caption hay cắt lệch (vd "ましょう" đứng một mình).
   //     Dòng quá ngắn thì nhập vào dòng liền kề — NHƯNG chỉ khi hai dòng thực
   //     sự liền mạch: nghỉ giữa chúng < [mergeGapMs]. Nghỉ dài = ngắt ý thật,
   //     gộp vào sẽ làm phụ đề lệch tiếng nói.
-  const minChars = 8;
+  const minChars = 6; // dòng ngắn hơn 6 chữ mới coi là vụn (trần 22 chữ)
   const mergeGapMs = 1200;
   int gapBetween(Map<String, dynamic> a, Map<String, dynamic> b) {
     final aw = (a['words'] as List).cast<Map<String, dynamic>>();
@@ -473,6 +577,9 @@ void alignTokenTimings(List<Map<String, dynamic>> tokens, String plain,
 /// Đang dịch nền cho video nào (tránh chạy trùng nhiều lượt cùng lúc).
 final Set<String> _bgTranslating = <String>{};
 
+/// Đang chạy tạo phụ đề HÀNG LOẠT (admin) — chỉ cho 1 lượt tại một thời điểm.
+bool _bulkSubsRunning = false;
+
 /// Bản dịch THẬT hay placeholder lỗi? `ai.translate` khi fail/mock trả
 /// "[VI] <câu gốc>" (không rỗng) — tuyệt đối KHÔNG được cache thứ này, nếu
 /// không câu đó hỏng vĩnh viễn (cache non-empty sẽ không bao giờ dịch lại).
@@ -523,6 +630,9 @@ Future<void> _translateWholeVideo(Db db, Ai ai, int vid, String lang) async {
     _bgTranslating.remove(key);
   }
 }
+
+/// Ký tự ngăn cách `meaning` và `reading` trong một ô cache tra từ.
+const String _dictSep = '\u0001';
 
 Router buildRouter(Db db, Ai ai, Asr asr) {
   final r = Router();
@@ -783,32 +893,109 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     return ok({'token': token, 'user': publicUser(u)});
   });
 
-  // Đăng nhập bằng nhà cung cấp (Google/Apple/Facebook). App gửi provider +
-  // providerId (lấy từ SDK OAuth) + email; backend upsert & phát JWT.
+  // Đăng nhập Google / Apple / Facebook.
+  // App gửi TOKEN gốc do SDK của nhà cung cấp phát; server XÁC THỰC ngược với
+  // nhà cung cấp rồi mới lấy providerId đáng tin → không thể mạo danh bằng
+  // cách bịa providerId. Nền tảng nào chưa cấu hình khoá (env) thì tự tắt.
   r.post('/auth/social', (Request req) async {
-    // ⚠️ BẢO MẬT: hiện endpoint TIN providerId do client gửi mà CHƯA xác thực
-    // OAuth token phía server → nếu bật thật, kẻ xấu có thể mạo danh bằng cách
-    // gửi providerId bất kỳ. Vì vậy MẶC ĐỊNH TẮT; chỉ bật ở dev qua env.
-    // TODO(prod): xác thực id_token/access_token với Google/Apple/Facebook rồi
-    // mới lấy providerId đáng tin, sau đó bỏ cổng chặn này.
-    if (Platform.environment['XSGO_ALLOW_DEMO_SOCIAL'] != '1') {
-      return bad(
-          'Đăng nhập mạng xã hội chưa được bật (cần xác thực OAuth phía server).',
-          code: 501);
+    // Chống dò/spam: 20 lượt/phút mỗi IP.
+    if (_limited('social:${_clientIp(req)}', 20, 60 * 1000)) {
+      return bad('Thử lại sau ít phút', code: 429);
     }
     final b = await readJson(req);
-    final provider = (b['provider'] as String?)?.trim();
-    final providerId = (b['providerId'] as String?)?.trim();
-    if (provider == null || provider.isEmpty || providerId == null || providerId.isEmpty) {
-      return bad('Thiếu provider hoặc providerId');
+    final provider = (b['provider'] as String?)?.trim().toLowerCase();
+    final token = (b['token'] as String?)?.trim();
+    if (provider == null || provider.isEmpty || token == null || token.isEmpty) {
+      return bad('Thiếu provider hoặc token');
     }
+    final env = Platform.environment;
+    List<String> ids(String key) => (env[key] ?? '')
+        .split(',')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+
+    VerifiedIdentity? id;
+    switch (provider) {
+      case 'google':
+        id = await verifyGoogleIdToken(token, ids('XSGO_GOOGLE_CLIENT_IDS'));
+      case 'apple':
+        id = await verifyAppleIdentityToken(token, ids('XSGO_APPLE_AUDIENCES'));
+      case 'facebook':
+        id = await verifyFacebookToken(token, env['XSGO_FB_APP_ID'] ?? '',
+            env['XSGO_FB_APP_SECRET'] ?? '');
+      default:
+        return bad('Nhà cung cấp không hỗ trợ: $provider');
+    }
+    if (id == null) {
+      return bad(
+          'Không xác thực được với $provider (token sai/hết hạn, hoặc máy chủ '
+          'chưa cấu hình khoá cho nhà cung cấp này).',
+          code: 401);
+    }
+    // ⛔ CHẶN CHIẾM QUYỀN ADMIN: `ensureRole` tự nâng quyền cho user mang
+    // email admin, nên đường social KHÔNG được tạo/đăng nhập vào email đó
+    // (route /auth/register cũng chặn tương tự, phải có bootstrap secret).
+    final socialEmail = id.email?.trim().toLowerCase();
+    if (socialEmail != null && socialEmail == adminEmail) {
+      return bad('Không được phép', code: 403);
+    }
+    // Email lấy TỪ NHÀ CUNG CẤP (đã xác thực); nếu họ không trả (Facebook,
+    // hoặc Apple ẩn email) thì để trống — KHÔNG tin email client tự gửi.
     final u = db.upsertSocial(
       provider: provider,
-      providerId: providerId,
-      email: (b['email'] as String?)?.trim().toLowerCase(),
+      providerId: id.providerId,
+      email: socialEmail,
+      emailVerified: id.emailVerified,
     );
-    final token = signJwt({'sub': u['id'], 'email': u['email']});
-    return ok({'token': token, 'user': publicUser(u)});
+    if ((u['disabled'] as int? ?? 0) == 1) {
+      return bad('Tài khoản đã bị khoá', code: 403);
+    }
+    // KHÔNG gọi ensureRole ở đây — quyền admin chỉ cấp qua /auth/register có
+    // bootstrap secret hoặc do admin sẵn có nâng quyền trong tab Quản trị.
+    final jwt = signJwt({'sub': u['id'], 'email': u['email']});
+    return ok({'token': jwt, 'user': publicUser(u)});
+  });
+
+  // -------- TRA NGHĨA TỪ (bấm vào từ trong phụ đề) --------
+  // Không cần đăng nhập (tra từ là chức năng học cơ bản), nhưng có giới hạn
+  // theo IP để không ai dùng nó như cổng dịch miễn phí. Có CACHE nên từ đã
+  // tra rồi trả về tức thì, không tốn thêm tiền AI.
+  r.post('/dict/lookup', (Request req) async {
+    if (_limited('dict:${_clientIp(req)}', 120, 60 * 1000)) {
+      return bad('Bạn tra hơi nhanh, thử lại sau chút', code: 429);
+    }
+    final b = await readJson(req);
+    final term = ((b['term'] as String?) ?? '').trim();
+    final lang = ((b['lang'] as String?) ?? 'vi').trim();
+    final context = ((b['context'] as String?) ?? '').trim();
+    if (term.isEmpty) return bad('Thiếu từ cần tra');
+    if (term.length > 40) return bad('Từ quá dài');
+
+    final key = 'dict:$term';
+    final cached = db.cachedTranslation(key, lang);
+    if (cached != null) {
+      final parts = cached.split(_dictSep);
+      return ok({
+        'term': term,
+        'reading': parts.length > 1 ? parts[1] : '',
+        'meaning': parts[0],
+        'cached': true,
+      });
+    }
+
+    final res = await ai.lookupWord(term, lang, context: context);
+    if (res == null) {
+      return bad('Chưa tra được nghĩa của từ này', code: 503);
+    }
+    db.putTranslation(key, lang,
+        '${res['meaning']}' + _dictSep + '${res['reading'] ?? ''}');
+    return ok({
+      'term': term,
+      'reading': res['reading'] ?? '',
+      'meaning': res['meaning'],
+      'cached': false,
+    });
   });
 
   // -------- videos --------
@@ -838,6 +1025,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
           'description': p['description'],
           'level': p['level'],
           'color': p['color'],
+          // 'home' = mục Danh sách phát trên Home · 'explore' = mục Khám phá.
+          'section': p['section'] ?? 'home',
           'videos': (p['videos'] as List)
               .map((v) => {
                     'id': v['id'],
@@ -858,18 +1047,33 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   // token thì loại video của người mình đã chặn). Video bị báo cáo nhiều tự ẩn.
   r.get('/discover', (Request req) {
     final uid = authUserId(req);
-    final list = db.communityVideos(uid).map((v) => {
-          'id': v['id'],
-          'title': v['title'],
-          'channel': v['channel'],
-          'level': v['level'],
-          'color': v['color'],
-          'youtubeId': v['youtube_id'],
-          'durationMs': v['duration_ms'],
-          'isOfficial': false,
-          'ownerId': v['owner_user_id'],
-          'mine': v['owner_user_id'] != null && v['owner_user_id'] == uid,
-        });
+    // Ngôn ngữ người xem: tài khoản đăng nhập → native_lang trong DB;
+    // khách → ?lang= (app gửi theo ngôn ngữ đang chọn). Mặc định vi.
+    var lang = req.url.queryParameters['lang'] ?? 'vi';
+    if (uid != null) {
+      lang = (db.userById(uid)?['native_lang'] as String?) ?? lang;
+    }
+    if (!_supportedLangs.contains(lang)) lang = 'vi';
+    final list = db.communityVideos(uid, lang: lang).map((v) {
+      final mine = v['owner_user_id'] != null && v['owner_user_id'] == uid;
+      // Người xem KHÁC chủ video → tiêu đề/kênh GỐC YouTube (nếu đã lấy được);
+      // chủ video vẫn thấy tên mình tự đặt.
+      final title = mine ? v['title'] : ((v['yt_title'] as String?) ?? v['title']);
+      final channel =
+          mine ? v['channel'] : ((v['yt_channel'] as String?) ?? v['channel']);
+      return {
+        'id': v['id'],
+        'title': title,
+        'channel': channel,
+        'level': v['level'],
+        'color': v['color'],
+        'youtubeId': v['youtube_id'],
+        'durationMs': v['duration_ms'],
+        'isOfficial': false,
+        'ownerId': v['owner_user_id'],
+        'mine': mine,
+      };
+    });
     return ok({'videos': list.toList()});
   });
 
@@ -922,10 +1126,21 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         'translation': tr[lang] ?? tr['vi'] ?? '',
       };
     }).toList();
+    // Video cộng đồng xem bởi người KHÁC chủ → tiêu đề/kênh gốc YouTube.
+    final vuid = authUserId(req);
+    final vMine = v['owner_user_id'] != null && v['owner_user_id'] == vuid;
+    final community = (v['is_official'] as int? ?? 0) == 0 &&
+        v['owner_user_id'] != null;
+    final showTitle = (community && !vMine)
+        ? ((v['yt_title'] as String?) ?? v['title'])
+        : v['title'];
+    final showChannel = (community && !vMine)
+        ? ((v['yt_channel'] as String?) ?? v['channel'])
+        : v['channel'];
     return ok({
       'id': v['id'],
-      'title': v['title'],
-      'channel': v['channel'],
+      'title': showTitle,
+      'channel': showChannel,
       'level': v['level'],
       'durationMs': v['duration_ms'],
       'youtubeId': v['youtube_id'],
@@ -952,9 +1167,11 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     if (title.isEmpty) return bad('Thiếu tiêu đề');
     final level = ((b['level'] as String?) ?? 'N5').trim();
     // Chặn video không cho phép nhúng (private / tắt embed) — nếu thêm sẽ hiện
-    // "This video is private" và không phát được trong app.
-    final embeddable = await _youtubeEmbeddable(ytId);
-    if (embeddable == false) {
+    // "This video is private" và không phát được trong app. Đồng thời lấy luôn
+    // TIÊU ĐỀ + KÊNH GỐC từ YouTube: người xem KHÁC chủ video sẽ thấy tên gốc
+    // này (không thấy tên tự đặt — chống tiêu đề misleading).
+    final info = await _youtubeInfo(ytId);
+    if (info.ok == false) {
       return bad(
           'Video này không cho phép nhúng (private hoặc chủ kênh tắt nhúng). '
           'Hãy chọn video khác cho phép phát ngoài YouTube.',
@@ -966,6 +1183,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       level: level,
       youtubeId: ytId,
       ownerUserId: uid,
+      ytTitle: info.title,
+      ytChannel: info.author,
     );
     final v = db.video(id)!;
     return ok({
@@ -1216,6 +1435,20 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     return ok(planFor(uid));
   });
 
+  // Cập nhật ngôn ngữ mẹ đẻ của tài khoản (app gọi khi user đổi ngôn ngữ) —
+  // dùng để lọc video cộng đồng theo ngôn ngữ ở /discover.
+  r.post('/me/lang', (Request req) async {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    final b = await readJson(req);
+    final lang = ((b['lang'] as String?) ?? '').trim();
+    if (!{'vi', 'my', 'id', 'ne'}.contains(lang)) {
+      return bad('Ngôn ngữ không hỗ trợ');
+    }
+    db.setNativeLang(uid, lang);
+    return ok({'ok': true, 'lang': lang});
+  });
+
   // Dùng thử 3 ngày — mỗi tài khoản 1 lần. Client gọi sau khi user chia sẻ MXH.
   r.post('/me/trial', (Request req) {
     final uid = authUserId(req);
@@ -1249,7 +1482,12 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   const publicConfigKeys = {
     'freePreview',
     'announce',
+    'announce_my', // thông báo riêng cho từng ngôn ngữ (rỗng → dùng 'announce')
+    'announce_id',
+    'announce_ne',
     'bjtPrice',
+    'tokuteiPrice', // giá khóa Tokutei hiển thị ở màn mua (rỗng → mặc định)
+    'saleBadge', // nhãn khuyến mãi ở màn mua, vd "🔥 Sale 8/8 · giảm 50%"
     'premium_enabled'
   };
   r.get('/config', (Request req) {
@@ -1614,6 +1852,23 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     return ok({'reports': list.toList()});
   });
 
+  // CHI PHÍ AI: tổng phút AI theo kỳ + top người dùng kỳ này (soát chi phí).
+  r.get('/admin/ai-usage', (Request req) {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    String two(int n) => n.toString().padLeft(2, '0');
+    final now = DateTime.now();
+    return ok(db.aiUsageSummary('${now.year}-${two(now.month)}'));
+  });
+
+  // THỐNG KÊ HỌC TẬP: user hoạt động 7/30 ngày + video xem nhiều nhất.
+  r.get('/admin/learn-stats', (Request req) {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    return ok(db.learnStats());
+  });
+
+
   // Đặt/ghi đè phụ đề cho 1 video (admin dán, hoặc lớp AI sinh ra ghi vào đây).
   // Nhận {lines: "mm:ss <câu JP [漢字|かな]> [ | dịch VI]"} — mỗi dòng 1 câu.
   r.post('/admin/videos/<id|[0-9]+>/subtitles', (Request req, String id) async {
@@ -1721,6 +1976,45 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     });
   }
 
+
+  // PHỤ ĐỀ HÀNG LOẠT: quét video chưa có phụ đề thật → tạo TUẦN TỰ ở nền
+  // (caption-first, không phụ thuộc admin còn mở app). Trả về số video xếp hàng.
+  r.post('/admin/videos/generate-subtitles-missing', (Request req) async {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    if (_bulkSubsRunning) {
+      return bad('Đang có một lượt tạo phụ đề hàng loạt chạy — chờ xong đã.');
+    }
+    final missing = db.videosMissingSubs(limit: 30);
+    if (missing.isEmpty) return ok({'queued': 0});
+    _bulkSubsRunning = true;
+    unawaited(() async {
+      try {
+        for (final v in missing) {
+          final vid = v['id'] as int;
+          // Ghi mốc ĐÃ THỬ (kể cả thất bại) — video hỏng vĩnh viễn không
+          // chiếm đầu hàng của lượt quét sau (nghỉ 24h mới thử lại).
+          db.markSubsAttempt(vid);
+          try {
+            final res = await genSubtitles(vid);
+            if (res.statusCode != 200) {
+              stderr.writeln(
+                  '[BULK-SUBS] video $vid bỏ qua (${res.statusCode}): '
+                  '${await res.readAsString()}');
+            }
+          } catch (e) {
+            stderr.writeln('[BULK-SUBS] video $vid: $e');
+          }
+          // Nghỉ giữa các video: tránh YouTube rate-limit + nhường event loop.
+          await Future.delayed(const Duration(seconds: 8));
+        }
+      } finally {
+        _bulkSubsRunning = false;
+      }
+    }());
+    return ok({'queued': missing.length});
+  });
+
   // Admin tạo phụ đề cho bất kỳ video nào.
   r.post('/admin/videos/<id|[0-9]+>/generate-subtitles',
       (Request req, String id) async {
@@ -1765,7 +2059,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
           title: title.isEmpty ? null : title,
           description: b['description'] as String?,
           level: b['level'] as String?,
-          position: b['position'] as int?);
+          position: b['position'] as int?,
+          section: b['section'] as String?);
       return ok({'id': idRaw});
     }
     if (title.isEmpty) return bad('Thiếu tên danh sách phát');
@@ -1774,8 +2069,28 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       description: (b['description'] as String?) ?? '',
       level: (b['level'] as String?) ?? '',
       position: (b['position'] as int?) ?? 0,
+      section: (b['section'] as String?) ?? 'home',
     );
     return ok({'id': newId});
+  });
+
+  // Xoá NHANH nhiều video một lần (admin dọn kho — kể cả video seed/demo).
+  r.post('/admin/videos/delete-bulk', (Request req) async {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    final b = await readJson(req);
+    final ids = ((b['ids'] as List?) ?? const [])
+        .whereType<num>()
+        .map((e) => e.toInt())
+        .toList();
+    if (ids.isEmpty) return bad('Thiếu danh sách id video');
+    // Trần số lượng: server đơn luồng (sqlite đồng bộ) — payload khổng lồ sẽ
+    // block mọi request khác. 1000/lượt là quá đủ cho thao tác dọn kho thật.
+    if (ids.length > 1000) {
+      return bad('Tối đa 1000 video mỗi lượt (đang gửi ${ids.length})');
+    }
+    final n = db.adminDeleteVideos(ids);
+    return ok({'deleted': n});
   });
 
   r.delete('/admin/playlists/<id|[0-9]+>', (Request req, String id) {

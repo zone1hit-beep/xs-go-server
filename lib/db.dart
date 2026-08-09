@@ -58,6 +58,13 @@ class Db {
     _safeAddColumn('videos', 'is_official', 'INTEGER NOT NULL DEFAULT 0');
     // hidden: admin ẩn video khỏi mọi feed (kiểm duyệt) mà không xoá hẳn.
     _safeAddColumn('videos', 'hidden', 'INTEGER NOT NULL DEFAULT 0');
+    // Tiêu đề/kênh GỐC từ YouTube (oEmbed) — người xem KHÁC chủ video thấy
+    // tên gốc này thay vì tên tự đặt của người thêm (chống tiêu đề misleading).
+    _safeAddColumn('videos', 'yt_title', 'TEXT');
+    _safeAddColumn('videos', 'yt_channel', 'TEXT');
+    // subs_attempted_at: mốc lần cuối THỬ tạo phụ đề hàng loạt (ms epoch) —
+    // để video fail vĩnh viễn không chiếm đầu hàng của lượt quét sau.
+    _safeAddColumn('videos', 'subs_attempted_at', 'INTEGER');
     // Video seed (owner null) mặc nhiên là chính thức.
     _db.execute(
         'UPDATE videos SET is_official = 1 WHERE owner_user_id IS NULL AND is_official = 0');
@@ -131,6 +138,8 @@ class Db {
         created_at INTEGER NOT NULL
       );
     ''');
+    // section: 'home' = mục "Danh sách phát" trên Home; 'explore' = mục Khám phá.
+    _safeAddColumn('playlists', 'section', "TEXT NOT NULL DEFAULT 'home'");
     _db.execute('''
       CREATE TABLE IF NOT EXISTS playlist_videos (
         playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
@@ -199,6 +208,86 @@ class Db {
         PRIMARY KEY (user_id, period_key)
       );
     ''');
+    // INDEX cho các truy vấn nóng — bắt buộc khi dữ liệu lớn (100k user):
+    // không có thì mỗi lần mở video / xem thống kê là full-table-scan.
+    _db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_sentences_video ON sentences(video_id)');
+    _db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_watch_last ON watch_history(last_seen)');
+    _db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_reports_video ON video_reports(video_id)');
+    _db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_videos_owner ON videos(owner_user_id)');
+  }
+
+  /// Tổng mức dùng AI theo THÁNG (6 tháng gần nhất) + top người dùng tháng này.
+  ///
+  /// ⚠️ Usage ghi dưới 2 dạng khóa: free 'M:yyyy-mm', premium 'D:yyyy-mm-dd'.
+  /// Phải CHUẨN HÓA cả hai về tháng — nếu chỉ lọc 'M:' thì premium (nhóm được
+  /// dùng nhiều nhất: 1h/ngày) biến mất khỏi báo cáo chi phí.
+  Map<String, dynamic> aiUsageSummary(String currentMonth) {
+    // currentMonth dạng 'yyyy-mm'.
+    final byMonth = _db.select('''
+      SELECT substr(period_key, 3, 7) month, SUM(used_sec) total,
+             COUNT(DISTINCT user_id) users
+      FROM ai_usage GROUP BY month ORDER BY month DESC LIMIT 6
+    ''');
+    final top = _db.select('''
+      SELECT u.email, SUM(a.used_sec) used_sec
+      FROM ai_usage a JOIN users u ON u.id = a.user_id
+      WHERE substr(a.period_key, 3, 7) = ?
+      GROUP BY a.user_id ORDER BY used_sec DESC LIMIT 10
+    ''', [currentMonth]);
+    return {
+      'periods': byMonth.map((r) => Map<String, dynamic>.from(r)).toList(),
+      'top': top.map((r) => Map<String, dynamic>.from(r)).toList(),
+    };
+  }
+
+  /// Thống kê học tập: người dùng hoạt động + video được xem nhiều.
+  Map<String, dynamic> learnStats() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final active7 = _db.select(
+        'SELECT COUNT(DISTINCT user_id) c FROM watch_history WHERE last_seen > ?',
+        [now - 7 * 86400000]).first['c'];
+    final active30 = _db.select(
+        'SELECT COUNT(DISTINCT user_id) c FROM watch_history WHERE last_seen > ?',
+        [now - 30 * 86400000]).first['c'];
+    final topVideos = _db.select(
+        'SELECT title, channel, COUNT(*) views, SUM(done) dones '
+        'FROM watch_history GROUP BY vkey ORDER BY views DESC LIMIT 10');
+    return {
+      'active7d': active7,
+      'active30d': active30,
+      'topVideos': topVideos.map((r) => Map<String, dynamic>.from(r)).toList(),
+    };
+  }
+
+  /// Video CHÍNH THỨC chưa có phụ đề thật (0 câu, hoặc chỉ 1 câu placeholder).
+  /// - CHỈ is_official=1: không đốt AI vào video riêng của học viên (chủ video
+  ///   có route tự tạo phụ đề riêng).
+  /// - Bỏ qua video ĐÃ THỬ trong 24h (subs_attempted_at): video hỏng vĩnh viễn
+  ///   (không CC + YouTube chặn tải audio) không chiếm đầu hàng mãi.
+  List<Map<String, dynamic>> videosMissingSubs({int limit = 50}) {
+    final dayAgo =
+        DateTime.now().millisecondsSinceEpoch - 24 * 3600 * 1000;
+    final r = _db.select('''
+      SELECT v.id, v.title, v.youtube_id,
+             (SELECT COUNT(*) FROM sentences s WHERE s.video_id = v.id) sc
+      FROM videos v
+      WHERE v.hidden = 0 AND v.youtube_id IS NOT NULL
+        AND v.is_official = 1
+        AND COALESCE(v.subs_attempted_at, 0) < ?
+        AND (SELECT COUNT(*) FROM sentences s WHERE s.video_id = v.id) <= 1
+      ORDER BY v.id LIMIT ?
+    ''', [dayAgo, limit]);
+    return r.map((row) => Map<String, dynamic>.from(row)).toList();
+  }
+
+  /// Ghi mốc đã thử tạo phụ đề cho video (thành công hay thất bại đều ghi).
+  void markSubsAttempt(int videoId) {
+    _db.execute('UPDATE videos SET subs_attempted_at = ? WHERE id = ?',
+        [DateTime.now().millisecondsSinceEpoch, videoId]);
   }
 
   void _safeAddColumn(String table, String column, String type) {
@@ -212,11 +301,24 @@ class Db {
   // ---------------- Seed ----------------
 
   void _seedIfEmpty() {
+    // Chỉ seed ĐÚNG MỘT LẦN trong đời DB (gate bằng cờ config 'seeded').
+    // Nếu chỉ dựa COUNT==0 thì sau khi admin "dọn sạch kho" bằng xoá hàng loạt,
+    // lần restart kế tiếp video demo (có cả placeholder) sẽ tự mọc lại.
+    final seeded = _db.select(
+        "SELECT value FROM config WHERE key = 'seeded'");
+    if (seeded.isNotEmpty && seeded.first['value'] == '1') return;
     final n = _db.select('SELECT COUNT(*) c FROM videos').first['c'] as int;
-    if (n > 0) return;
+    if (n > 0) {
+      // DB cũ đã có dữ liệu → coi như từng seed, chỉ ghi cờ.
+      setConfig('seeded', '1');
+      return;
+    }
     for (final v in _seedVideos) {
       _db.execute(
-        'INSERT INTO videos (title, channel, level, color, youtube_id, duration_ms) VALUES (?,?,?,?,?,?)',
+        // is_official=1 NGAY khi seed: cột này chỉ được _migrate cập nhật ở
+        // lần khởi động SAU, nên nếu không đặt ở đây thì lần chạy đầu tiên
+        // video demo bị ẩn với mọi người (phải restart lần 2 mới hiện).
+        'INSERT INTO videos (title, channel, level, color, youtube_id, duration_ms, is_official) VALUES (?,?,?,?,?,?,1)',
         [v.title, v.channel, v.level, v.color, v.youtubeId, v.durationMs],
       );
       final vid = _db.lastInsertRowId;
@@ -237,6 +339,7 @@ class Db {
         );
       }
     }
+    setConfig('seeded', '1'); // không bao giờ tự seed lại nữa
   }
 
   // ---------------- Users / Auth ----------------
@@ -267,6 +370,12 @@ class Db {
     _db.execute(
         'INSERT INTO progress (user_id, goal_words) VALUES (?, 10)', [id]);
     return id;
+  }
+
+  /// Cập nhật ngôn ngữ mẹ đẻ (app gọi khi user đổi ngôn ngữ trong Cài đặt).
+  void setNativeLang(int userId, String lang) {
+    _db.execute(
+        'UPDATE users SET native_lang = ? WHERE id = ?', [lang, userId]);
   }
 
   // ---------------- Admin: users ----------------
@@ -403,19 +512,31 @@ class Db {
 
   /// Đăng nhập bằng nhà cung cấp (Google/Apple/Facebook...). Tìm theo
   /// provider+providerId, rồi theo email, nếu chưa có thì tạo mới. Trả về user.
+  /// [emailVerified] = nhà cung cấp đã xác minh email. CHỈ khi đó mới gộp
+  /// vào tài khoản email/mật khẩu trùng email (chống chiếm tài khoản).
   Map<String, dynamic> upsertSocial({
     required String provider,
     required String providerId,
     String? email,
+    bool emailVerified = false,
   }) {
     final byProvider = _db.select(
         'SELECT * FROM users WHERE provider = ? AND provider_id = ?',
         [provider, providerId]);
     if (byProvider.isNotEmpty) return Map<String, dynamic>.from(byProvider.first);
 
-    if (email != null && email.isNotEmpty) {
+    // CHỈ tin email khi nhà cung cấp KHẲNG ĐỊNH đã xác minh. Không xác minh →
+    // coi như không có email: vừa không gộp tài khoản, vừa KHÔNG ghi email đó
+    // vào hồ sơ (nếu ghi, kẻ xấu chiếm được chỗ email của người khác).
+    final trusted = emailVerified && email != null && email.isNotEmpty;
+
+    if (trusted) {
       final existing = userByEmail(email);
       if (existing != null) {
+        // Tài khoản đang bị khoá thì không cho gắn danh tính mới vào để mở lối.
+        if ((existing['disabled'] as int? ?? 0) == 1) {
+          return Map<String, dynamic>.from(existing);
+        }
         _db.execute(
             'UPDATE users SET provider = ?, provider_id = ? WHERE id = ?',
             [provider, providerId, existing['id']]);
@@ -423,9 +544,8 @@ class Db {
       }
     }
 
-    final finalEmail = (email != null && email.isNotEmpty)
-        ? email
-        : '${provider}_$providerId@xsgo.social';
+    final finalEmail =
+        trusted ? email : '${provider}_$providerId@xsgo.social';
     _db.execute(
       'INSERT INTO users (email, password, native_lang, level, provider, provider_id, created_at) VALUES (?,?,?,?,?,?,?)',
       [
@@ -461,15 +581,20 @@ class Db {
 
   /// Video CỘNG ĐỒNG cho mục Khám phá: video do học viên thêm (không chính thức),
   /// chưa bị ẩn, chủ video không nằm trong danh sách mình đã chặn.
-  List<Map<String, dynamic>> communityVideos(int? userId) {
+  /// Video cộng đồng LỌC THEO NGÔN NGỮ: chỉ hiện video do học viên CÙNG
+  /// ngôn ngữ mẹ đẻ [lang] đăng (video của chính mình luôn thấy).
+  List<Map<String, dynamic>> communityVideos(int? userId, {String lang = 'vi'}) {
     final r = _db.select(
-        'SELECT id,title,channel,level,color,youtube_id,duration_ms,'
-        'is_official,owner_user_id FROM videos '
-        'WHERE hidden = 0 AND is_official = 0 AND owner_user_id IS NOT NULL '
-        'AND owner_user_id NOT IN '
+        'SELECT v.id,v.title,v.channel,v.level,v.color,v.youtube_id,'
+        'v.duration_ms,v.is_official,v.owner_user_id,v.yt_title,v.yt_channel '
+        'FROM videos v '
+        'JOIN users u ON u.id = v.owner_user_id '
+        'WHERE v.hidden = 0 AND v.is_official = 0 '
+        'AND (u.native_lang = ? OR v.owner_user_id = ?) '
+        'AND v.owner_user_id NOT IN '
         '(SELECT blocked_id FROM user_blocks WHERE user_id = ?) '
-        'ORDER BY id DESC',
-        [userId ?? -1]);
+        'ORDER BY v.id DESC',
+        [lang, userId ?? -1, userId ?? -1]);
     return r.map((row) => Map<String, dynamic>.from(row)).toList();
   }
 
@@ -732,10 +857,12 @@ class Db {
     required String youtubeId,
     int? ownerUserId,
     bool official = false,
+    String? ytTitle,
+    String? ytChannel,
   }) {
     _db.execute(
-      'INSERT INTO videos (title, channel, level, color, youtube_id, duration_ms, owner_user_id, is_official) VALUES (?,?,?,?,?,?,?,?)',
-      [title, channel, level, 0xFF0EA5E9, youtubeId, 60000, ownerUserId, official ? 1 : 0],
+      'INSERT INTO videos (title, channel, level, color, youtube_id, duration_ms, owner_user_id, is_official, yt_title, yt_channel) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      [title, channel, level, 0xFF0EA5E9, youtubeId, 60000, ownerUserId, official ? 1 : 0, ytTitle, ytChannel],
     );
     final vid = _db.lastInsertRowId;
     _db.execute(
@@ -833,17 +960,41 @@ class Db {
       String description = '',
       String level = '',
       int color = 0xFF0EA5E9,
-      int position = 0}) {
+      int position = 0,
+      String section = 'home'}) {
     _db.execute(
-      'INSERT INTO playlists (title, description, level, color, position, created_at) VALUES (?,?,?,?,?,?)',
-      [title, description, level, color, position,
+      'INSERT INTO playlists (title, description, level, color, position, section, created_at) VALUES (?,?,?,?,?,?,?)',
+      [title, description, level, color, position, section,
         DateTime.now().millisecondsSinceEpoch],
     );
     return _db.lastInsertRowId;
   }
 
+  /// Xoá nhiều video một lần (admin dọn nhanh — kể cả video seed/official).
+  /// Sentences + playlist_videos tự xoá theo (ON DELETE CASCADE).
+  /// Gói trong MỘT transaction: nhanh hơn hẳn (1 fsync) và không xoá dở dang.
+  int adminDeleteVideos(List<int> ids) {
+    var n = 0;
+    _db.execute('BEGIN');
+    try {
+      for (final id in ids) {
+        _db.execute('DELETE FROM videos WHERE id = ?', [id]);
+        n += _db.updatedRows;
+      }
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return n;
+  }
+
   void updatePlaylist(int id,
-      {String? title, String? description, String? level, int? position}) {
+      {String? title,
+      String? description,
+      String? level,
+      int? position,
+      String? section}) {
     final sets = <String>[];
     final args = <Object?>[];
     if (title != null) {
@@ -861,6 +1012,10 @@ class Db {
     if (position != null) {
       sets.add('position = ?');
       args.add(position);
+    }
+    if (section != null) {
+      sets.add('section = ?');
+      args.add(section);
     }
     if (sets.isEmpty) return;
     args.add(id);

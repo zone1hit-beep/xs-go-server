@@ -6,7 +6,14 @@ import 'dart:io';
 class Ai {
   final String? apiKey;
   final String model;
-  Ai({this.apiKey, this.model = 'claude-opus-4-8'});
+
+  /// Model RIÊNG cho DỊCH phụ đề — dịch câu ngắn là việc Haiku làm tốt với giá
+  /// rẻ ~5 lần Opus ($1/$5 vs $5/$25 mỗi triệu token). Furigana (cách đọc
+  /// kanji, cần chính xác cao) vẫn dùng [model] chính.
+  final String translateModel;
+
+  Ai({this.apiKey, this.model = 'claude-opus-4-8', String? translateModel})
+      : translateModel = translateModel ?? 'claude-opus-4-8';
 
   bool get enabled => apiKey != null && apiKey!.isNotEmpty;
 
@@ -16,6 +23,39 @@ class Ai {
     'id': 'Indonesian',
     'ne': 'Nepali',
   };
+
+  /// TRA NGHĨA một từ tiếng Nhật trong ngữ cảnh câu. Trả `{reading, meaning}`
+  /// hoặc null nếu AI tắt/lỗi. Dùng model RẺ (dịch) — đây là tra từ ngắn.
+  Future<Map<String, String>?> lookupWord(String term, String lang,
+      {String context = ''}) async {
+    if (!enabled || term.trim().isEmpty) return null;
+    final target = _langNames[lang] ?? lang;
+    final ctx = context.trim().isEmpty
+        ? ''
+        : '\nCâu chứa từ này: $context';
+    final prompt =
+        'Japanese word lookup for a language-learning app. Word: "$term".$ctx\n'
+        'Reply with EXACTLY two lines, nothing else:\n'
+        'READING: <hiragana reading of the word, empty if it is already kana>\n'
+        'MEANING: <short $target meaning, max 12 words; if the word is an '
+        'inflected form, give the dictionary form in parentheses>';
+    final text = await _message(prompt,
+        maxTokens: 200, modelOverride: translateModel);
+    if (text == null) return null;
+    String pick(String key) {
+      for (final line in text.split('\n')) {
+        final t = line.trim();
+        if (t.toUpperCase().startsWith('$key:')) {
+          return t.substring(key.length + 1).trim();
+        }
+      }
+      return '';
+    }
+
+    final meaning = pick('MEANING');
+    if (meaning.isEmpty) return null;
+    return {'reading': pick('READING'), 'meaning': meaning};
+  }
 
   /// Dịch danh sách câu tiếng Nhật sang [lang]. Trả về list cùng độ dài.
   Future<List<String>> translate(List<String> jp, String lang) async {
@@ -35,7 +75,8 @@ class Ai {
     // max_tokens theo cỡ lô — lô lớn mà để 1024 sẽ bị cắt giữa chừng, các câu
     // cuối rơi về placeholder "[LANG] …".
     final budget = (200 + jp.length * 90).clamp(1024, 8000);
-    final text = await _message(prompt, maxTokens: budget);
+    final text =
+        await _message(prompt, maxTokens: budget, modelOverride: translateModel);
     if (text == null) {
       return jp.map((s) => '[${lang.toUpperCase()}] $s').toList();
     }
@@ -69,7 +110,8 @@ class Ai {
         'words/phrases — KEEP any Japanese (kanji/kana) exactly as-is, translate '
         'only the surrounding explanation. Preserve meaning and tone for learners. '
         'Keep the same numbering, one line each, no extra commentary.\n\n$numbered';
-    final text = await _message(prompt, maxTokens: 2048);
+    final text =
+        await _message(prompt, maxTokens: 2048, modelOverride: translateModel);
     if (text == null) return List<String>.from(texts);
     final out = List<String>.from(texts); // mặc định nguồn nếu bóc thiếu
     for (final line in const LineSplitter().convert(text)) {
@@ -131,7 +173,8 @@ class Ai {
   }
 
   /// Gọi Anthropic Messages API. Trả về text hoặc null nếu lỗi.
-  Future<String?> _message(String prompt, {int maxTokens = 1024}) async {
+  Future<String?> _message(String prompt,
+      {int maxTokens = 1024, String? modelOverride}) async {
     try {
       final client = HttpClient();
       final req = await client
@@ -140,7 +183,7 @@ class Ai {
       req.headers.set('x-api-key', apiKey!);
       req.headers.set('anthropic-version', '2023-06-01');
       req.add(utf8.encode(jsonEncode({
-        'model': model,
+        'model': modelOverride ?? model,
         'max_tokens': maxTokens,
         'messages': [
           {'role': 'user', 'content': prompt}
