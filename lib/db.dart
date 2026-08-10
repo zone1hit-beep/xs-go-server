@@ -208,6 +208,61 @@ class Db {
         PRIMARY KEY (user_id, period_key)
       );
     ''');
+    // ---- Google Play Billing ----
+    // entitlements granular: video_monthly / video_yearly / bjt_lifetime /
+    // tokutei_<ngành> / all_access_lifetime (+ key cũ 'bjt','tokutei' admin cấp).
+    // expires_at: 0 = trọn đời; >0 = mốc hết hạn ms (subscription).
+    _safeAddColumn('entitlements', 'expires_at', 'INTEGER NOT NULL DEFAULT 0');
+    // source: 'admin' | 'google_play' — để RTDN/re-verify chỉ đụng quyền do
+    // Google Play cấp, không xoá nhầm quyền admin tặng tay.
+    _safeAddColumn('entitlements', 'source', "TEXT NOT NULL DEFAULT 'admin'");
+    // Mỗi giao dịch Google Play (purchaseToken là định danh duy nhất).
+    // Gắn CHẶT với user đầu tiên xác minh — restore trên tài khoản app khác bị
+    // từ chối (chống 1 người mua, cả nhóm dùng chung token).
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS purchases (
+        purchase_token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        state TEXT NOT NULL,
+        order_id TEXT,
+        expiry_ms INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    ''');
+    // Quota XEM video của Free (3h/tháng): period_key = 'V:yyyy-mm'.
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS video_usage (
+        user_id INTEGER NOT NULL,
+        period_key TEXT NOT NULL,
+        used_sec INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, period_key)
+      );
+    ''');
+    // Quota NHẬP video của Video Premium (3 video/ngày): day_key = 'yyyy-mm-dd'.
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS import_log (
+        user_id INTEGER NOT NULL,
+        day_key TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, day_key)
+      );
+    ''');
+    // Câu placeholder CŨ hứa "AI tự tạo phụ đề sẽ có ở bản sau" — App Store
+    // 2.1 không nhận nội dung hứa tính năng tương lai. Đổi sang hướng dẫn dùng
+    // được ngay (CC của YouTube) cho các video đã nằm trong DB.
+    _db.execute(
+      "UPDATE sentences SET translations_json = ? "
+      "WHERE text_jp = '字幕はまだありません' AND translations_json LIKE '%bản sau%'",
+      [
+        jsonEncode({
+          'vi': 'Video này chưa có phụ đề trong XS GO. Bấm nút CC trên trình '
+              'phát để dùng phụ đề của YouTube.'
+        })
+      ],
+    );
     // INDEX cho các truy vấn nóng — bắt buộc khi dữ liệu lớn (100k user):
     // không có thì mỗi lần mở video / xem thống kê là full-table-scan.
     _db.execute(
@@ -421,22 +476,105 @@ class Db {
 
   // ---------------- Entitlements ----------------
 
+  /// Quyền CÒN HIỆU LỰC (expires_at = 0 là trọn đời; >0 phải lớn hơn hiện tại).
   List<String> userEntitlements(int userId) {
     final r = _db.select(
-        'SELECT course_key FROM entitlements WHERE user_id = ?', [userId]);
+        'SELECT course_key FROM entitlements '
+        'WHERE user_id = ? AND (expires_at = 0 OR expires_at > ?)',
+        [userId, DateTime.now().millisecondsSinceEpoch]);
     return r.map((e) => e['course_key'] as String).toList();
   }
 
-  void grantEntitlement(int userId, String courseKey) {
+  /// Cấp quyền. [expiresAt] 0 = trọn đời. Cấp lại thì CẬP NHẬT hạn (subscription
+  /// gia hạn) + nguồn cấp — INSERT OR REPLACE giữ nguyên khóa chính (user, key).
+  void grantEntitlement(int userId, String courseKey,
+      {int expiresAt = 0, String source = 'admin'}) {
     _db.execute(
-        'INSERT OR IGNORE INTO entitlements (user_id, course_key, granted_at) VALUES (?,?,?)',
-        [userId, courseKey, DateTime.now().millisecondsSinceEpoch]);
+        'INSERT INTO entitlements (user_id, course_key, granted_at, expires_at, source) '
+        'VALUES (?,?,?,?,?) '
+        'ON CONFLICT(user_id, course_key) DO UPDATE SET '
+        'expires_at = excluded.expires_at, source = excluded.source',
+        [
+          userId,
+          courseKey,
+          DateTime.now().millisecondsSinceEpoch,
+          expiresAt,
+          source
+        ]);
   }
 
   void revokeEntitlement(int userId, String courseKey) {
     _db.execute(
         'DELETE FROM entitlements WHERE user_id = ? AND course_key = ?',
         [userId, courseKey]);
+  }
+
+  // ---------------- Google Play purchases ----------------
+
+  Map<String, dynamic>? purchaseByToken(String token) {
+    final r = _db.select(
+        'SELECT * FROM purchases WHERE purchase_token = ?', [token]);
+    return r.isEmpty ? null : Map<String, dynamic>.from(r.first);
+  }
+
+  void upsertPurchase({
+    required String token,
+    required int userId,
+    required String productId,
+    required String kind, // 'subs' | 'inapp'
+    required String state, // 'active'|'pending'|'canceled'|'expired'|'revoked'
+    String? orderId,
+    int expiryMs = 0,
+  }) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'INSERT INTO purchases (purchase_token, user_id, product_id, kind, state, order_id, expiry_ms, created_at, updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?) '
+        'ON CONFLICT(purchase_token) DO UPDATE SET '
+        'state = excluded.state, order_id = COALESCE(excluded.order_id, purchases.order_id), '
+        'expiry_ms = excluded.expiry_ms, updated_at = excluded.updated_at',
+        [token, userId, productId, kind, state, orderId, expiryMs, now, now]);
+  }
+
+  /// Các subscription ĐANG active nhưng đã quá hạn ghi nhận — cần re-verify
+  /// với Google (gia hạn thành công thì cập nhật hạn mới, không thì hết quyền).
+  List<Map<String, dynamic>> stalePurchasesOf(int userId, int nowMs) {
+    final r = _db.select(
+        "SELECT * FROM purchases WHERE user_id = ? AND kind = 'subs' "
+        'AND state = ? AND expiry_ms > 0 AND expiry_ms < ?',
+        [userId, 'active', nowMs]);
+    return r.map((e) => Map<String, dynamic>.from(e)).toList();
+  }
+
+  // ---------------- Quota video (xem + nhập) ----------------
+
+  int videoUsedSec(int userId, String periodKey) {
+    final r = _db.select(
+        'SELECT used_sec FROM video_usage WHERE user_id = ? AND period_key = ?',
+        [userId, periodKey]);
+    return r.isEmpty ? 0 : (r.first['used_sec'] as int);
+  }
+
+  void addVideoUsage(int userId, String periodKey, int sec) {
+    _db.execute(
+        'INSERT INTO video_usage (user_id, period_key, used_sec) VALUES (?,?,?) '
+        'ON CONFLICT(user_id, period_key) DO UPDATE SET '
+        'used_sec = used_sec + excluded.used_sec',
+        [userId, periodKey, sec]);
+  }
+
+  int importCount(int userId, String dayKey) {
+    final r = _db.select(
+        'SELECT count FROM import_log WHERE user_id = ? AND day_key = ?',
+        [userId, dayKey]);
+    return r.isEmpty ? 0 : (r.first['count'] as int);
+  }
+
+  void addImport(int userId, String dayKey) {
+    _db.execute(
+        'INSERT INTO import_log (user_id, day_key, count) VALUES (?,?,1) '
+        'ON CONFLICT(user_id, day_key) DO UPDATE SET count = count + 1',
+        [userId, dayKey]);
   }
 
   // ---------------- Premium / hạn mức AI ----------------
@@ -877,8 +1015,12 @@ class Db {
           {'surface': '字幕はまだありません', 'tappable': false}
         ]),
         '[]',
+        // KHÔNG hứa tính năng tương lai ở đây: câu này hiện trong app nên phải
+        // nói đúng việc người học làm được NGAY (App Store 2.1 loại nội dung
+        // kiểu "sẽ có ở bản sau").
         jsonEncode({
-          'vi': 'Video chưa có phụ đề — AI tự tạo phụ đề sẽ có ở bản sau.'
+          'vi': 'Video này chưa có phụ đề trong XS GO. Bấm nút CC trên trình '
+              'phát để dùng phụ đề của YouTube.'
         }),
       ],
     );

@@ -7,6 +7,7 @@ import 'package:shelf_router/shelf_router.dart';
 
 import 'ai.dart';
 import 'asr.dart';
+import 'billing.dart';
 import 'db.dart';
 import 'security.dart';
 import 'social_auth.dart';
@@ -299,12 +300,17 @@ final _endTail = RegExp(
 /// Đuôi NỐI VẾ — cắt sau chúng chấp nhận được (nghỉ ngắn giữa câu).
 final _joinTail = RegExp(r'(て|で|が|けど|けれど|から|ので|のに|し|たら|ば|と)$');
 
-/// Mảnh MỞ ĐẦU bằng đuôi động từ — TUYỆT ĐỐI không cắt ngay trước nó, vì sẽ
-/// tách đuôi khỏi thân từ (vd 「始め | ます」) — đây chính là lỗi làm phụ đề
-/// lệch nhịp đọc.
+/// Mảnh MỞ ĐẦU bằng đuôi động từ / TRỢ TỪ / danh từ phụ thuộc — TUYỆT ĐỐI
+/// không cắt ngay trước nó. Tiếng Nhật gắn đuôi và trợ từ vào từ ĐỨNG TRƯỚC,
+/// nên cắt ở đây là cắt vào giữa một cụm đang đọc liền:
+///   「始め | ます」「ジャパニーズ | のレーラ」「行った | 時の話」
+/// — đây chính là lỗi làm phụ đề lệch nhịp đọc.
 final _startTail = RegExp(
     r'^(ます|ました|ません|ませんでした|でした|です|ている|ています|'
-    r'ていました|た|て|られ|させ|そう|ながら)');
+    r'ていました|た|て|られ|させ|そう|ながら|' // đuôi động từ
+    r'の|を|が|は|に|へ|と|で|も|か|ね|よ|な|ら|ば|し|や|から|まで|より|'
+    r'ので|のに|けど|けれど|' // trợ từ (luôn dính từ trước)
+    r'時|こと|もの|ため|よう|はず|わけ|つもり|ところ)'); // danh từ phụ thuộc
 
 /// Chia một cụm từ liền mạch (không có chỗ nghỉ) thành các dòng phụ đề, cắt ở
 /// điểm TỰ NHIÊN nhất: ưu tiên khoảng nghỉ dài nhất + ranh giới vế câu, và
@@ -771,6 +777,67 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     };
   }
 
+  // ============================================================
+  //  GOOGLE PLAY BILLING — helpers (routes ở dưới, sau /me/*)
+  // ============================================================
+  final gplay = GooglePlayVerifier(Platform.environment);
+  final catalog = BillingCatalog(Platform.environment);
+  // Công tắc BÁN HÀNG phía server (đồng bộ với kSellingEnabled trong app):
+  // bật = enforce quota xem/nhập video. Đặt: POST /admin/config {selling_enabled:'1'}
+  bool sellingEnabled() => (db.allConfig()['selling_enabled'] ?? '0') == '1';
+  String pad2(int n) => n.toString().padLeft(2, '0');
+  String videoPeriodKey() {
+    final n = DateTime.now();
+    return 'V:${n.year}-${pad2(n.month)}';
+  }
+
+  String dayKey() {
+    final n = DateTime.now();
+    return '${n.year}-${pad2(n.month)}-${pad2(n.day)}';
+  }
+
+  /// Xác minh 1 giao dịch với Google rồi ghi kết quả vào DB (purchases +
+  /// entitlements). Trả về state cuối cùng ('active'/'pending'/...).
+  Future<String> applyVerified(int uid, String productId, String token) async {
+    final isSub = catalog.isSubscription(productId);
+    final entKey = catalog.entitlementOf(productId)!;
+    final v = isSub
+        ? await gplay.verifySubscription(token)
+        : await gplay.verifyProduct(productId, token);
+    db.upsertPurchase(
+      token: token,
+      userId: uid,
+      productId: productId,
+      kind: isSub ? 'subs' : 'inapp',
+      state: v.state,
+      orderId: v.orderId,
+      expiryMs: v.expiryMs,
+    );
+    if (v.state == 'active') {
+      // Mua đứt: trọn đời (expires 0). Subscription: hết hạn theo Google —
+      // gia hạn thành công thì lần verify sau đẩy mốc mới.
+      db.grantEntitlement(uid, entKey,
+          expiresAt: isSub ? v.expiryMs : 0, source: 'google_play');
+      if (v.needsAck) {
+        // Lưới an toàn: Google TỰ HOÀN TIỀN sau 3 ngày nếu không acknowledge.
+        try {
+          if (isSub) {
+            await gplay.acknowledgeSubscription(productId, token);
+          } else {
+            await gplay.acknowledgeProduct(productId, token);
+          }
+        } catch (e) {
+          stderr.writeln('[billing] ack lỗi (client sẽ tự ack): $e');
+        }
+      }
+    } else if (isSub) {
+      // Sub hết hạn/hold → hạ mốc hết hạn (quyền tự rơi khỏi userEntitlements).
+      db.grantEntitlement(uid, entKey,
+          expiresAt: v.expiryMs > 0 ? v.expiryMs : 1, source: 'google_play');
+    }
+    return v.state;
+  }
+
   /// Guard hạn mức route AI: cờ TẮT hoặc khách → không chặn (ra mắt free chạy
   /// như cũ). Cờ BẬT & hết hạn mức → 429 (code ai_limit); còn thì ghi usage.
   Response? aiLimitGuard(int? uid, int costSec) {
@@ -807,13 +874,15 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       );
 
   r.get('/privacy', (Request req) => htmlPage('Chính sách bảo mật', '''
-    <h1>Chính sách bảo mật</h1><p>Cập nhật: 07/2026</p>
+    <h1>Chính sách bảo mật</h1><p>Cập nhật: 08/2026</p>
     <h2>1. Thông tin thu thập</h2><p>Email (khi đăng ký), ngôn ngữ mẹ đẻ, trình độ,
     tiến độ học (streak, số từ, bài đã học) và kho từ vựng bạn lưu. Đăng nhập bằng
     Google/Apple/Facebook: nhận email và mã định danh do nhà cung cấp cấp.</p>
     <h2>2. Mục đích</h2><p>Đồng bộ tiến độ giữa các thiết bị, cá nhân hoá nội dung,
     dịch nội dung sang ngôn ngữ của bạn, cải thiện khóa học. Chúng tôi KHÔNG bán dữ liệu.</p>
-    <h2>3. Nội dung bạn tạo</h2><p>Video YouTube bạn tự thêm là riêng tư — chỉ bạn thấy.
+    <h2>3. Nội dung bạn tạo</h2><p>Video YouTube bạn tự thêm có thể hiển thị ở mục
+    Khám phá cộng đồng cho học viên dùng cùng ngôn ngữ (hiển thị theo tiêu đề gốc
+    YouTube); video vi phạm hoặc bị báo cáo sẽ bị ẩn/gỡ.
     Phản hồi bạn gửi được lưu để xử lý.</p>
     <h2>4. Lưu trữ &amp; bảo mật</h2><p>Dữ liệu lưu trên máy chủ XS GO; mật khẩu được băm.
     Áp dụng biện pháp bảo vệ hợp lý nhưng không hệ thống nào an toàn tuyệt đối.</p>
@@ -1112,6 +1181,22 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         return bad('Không tìm thấy video', code: 404);
       }
     }
+    // Khi BÁN HÀNG bật: Free đã xem hết 3h/tháng → chặn tải nội dung học
+    // (phụ đề/từ vựng) ở server — sửa state local trong app không lách được.
+    if (sellingEnabled()) {
+      final quid = authUserId(req);
+      if (quid != null &&
+          db.userById(quid)?['role'] != 'admin' &&
+          !hasVideoPremium(db.userEntitlements(quid))) {
+        final used = db.videoUsedSec(quid, videoPeriodKey());
+        if (used >= cfgInt('video_free_month_sec', 10800)) {
+          return bad(
+              'Bạn đã dùng hết 3 giờ video miễn phí tháng này. '
+              'Nâng cấp Video Premium để xem không giới hạn.',
+              code: 429);
+        }
+      }
+    }
     final lang = req.url.queryParameters['lang'] ?? 'vi';
     final sentences = db.sentences(int.parse(id)).map((s) {
       final tr = jsonDecode(s['translations_json'] as String) as Map;
@@ -1156,6 +1241,24 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   r.post('/videos', (Request req) async {
     final uid = authUserId(req);
     if (uid == null) return bad('Cần đăng nhập', code: 401);
+    // Khi BÁN HÀNG bật: nhập video riêng là quyền của Video Premium
+    // (Monthly/Yearly/All Access), tối đa 3 video/ngày. Enforce ở SERVER —
+    // restart app hay sửa state local không lách được. Admin không giới hạn.
+    if (sellingEnabled() && db.userById(uid)?['role'] != 'admin') {
+      if (!hasVideoPremium(db.userEntitlements(uid))) {
+        return bad(
+            'Nhập video riêng là quyền của gói Video Premium. '
+            'Nâng cấp để tự thêm video YouTube bạn thích.',
+            code: 403);
+      }
+      if (db.importCount(uid, dayKey()) >=
+          cfgInt('import_day_limit', 3)) {
+        return bad(
+            'Bạn đã nhập đủ ${cfgInt('import_day_limit', 3)} video hôm nay. '
+            'Mai quay lại nhé!',
+            code: 429);
+      }
+    }
     final b = await readJson(req);
     final raw = ((b['youtube'] as String?) ?? '').trim();
     final m = RegExp(
@@ -1186,6 +1289,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       ytTitle: info.title,
       ytChannel: info.author,
     );
+    // Ghi sổ nhập video (đếm cả khi chưa bật bán — có sẵn dữ liệu khi bật).
+    db.addImport(uid, dayKey());
     final v = db.video(id)!;
     return ok({
       'id': v['id'],
@@ -1461,11 +1566,162 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     return ok(planFor(uid));
   });
 
-  // -------- entitlements của chính mình (app kéo về sau login) --------
-  r.get('/me/entitlements', (Request req) {
+  // ============================================================
+  //  GOOGLE PLAY BILLING — routes
+  // ============================================================
+  // Client gửi purchaseToken sau khi mua/restore → server xác minh với Google
+  // rồi mới cấp quyền. KHÔNG BAO GIỜ cấp quyền chỉ vì client nói đã mua.
+  r.post('/billing/google/verify', (Request req) async {
     final uid = authUserId(req);
     if (uid == null) return bad('Cần đăng nhập', code: 401);
+    if (!gplay.enabled) {
+      return bad(
+          'Máy chủ chưa cấu hình xác minh Google Play (XSGO_GPLAY_SA_JSON). '
+          'Liên hệ hỗ trợ.',
+          code: 503);
+    }
+    // Chống dò token bừa bãi.
+    if (_limited('bill:u$uid', 30, 3600 * 1000)) {
+      return bad('Quá nhiều yêu cầu, thử lại sau', code: 429);
+    }
+    final b = await readJson(req);
+    final productId = ((b['productId'] as String?) ?? '').trim();
+    final token = ((b['purchaseToken'] as String?) ?? '').trim();
+    if (productId.isEmpty || token.isEmpty || token.length > 4096) {
+      return bad('Thiếu productId/purchaseToken');
+    }
+    if (catalog.entitlementOf(productId) == null) {
+      return bad('Sản phẩm không hợp lệ: $productId');
+    }
+    // Token đã gắn tài khoản app KHÁC → từ chối (chống mua 1 lần dùng nhiều
+    // tài khoản). Người thật đổi tài khoản → liên hệ hỗ trợ chuyển tay.
+    final existing = db.purchaseByToken(token);
+    if (existing != null && existing['user_id'] != uid) {
+      return bad(
+          'Giao dịch này đã gắn với tài khoản XS GO khác. '
+          'Hãy đăng nhập đúng tài khoản đã mua, hoặc liên hệ hỗ trợ.',
+          code: 409);
+    }
+    try {
+      final state = await applyVerified(uid, productId, token);
+      return ok({'status': state, 'owned': db.userEntitlements(uid)});
+    } on PurchaseNotFound {
+      return bad('Giao dịch không tồn tại trên Google Play', code: 400);
+    } catch (e) {
+      stderr.writeln('[billing] verify lỗi: $e');
+      return bad('Không xác minh được với Google Play, thử lại sau',
+          code: 502);
+    }
+  });
+
+  // Real-time developer notifications (Pub/Sub push) — gia hạn/hết hạn/hoàn
+  // tiền cập nhật NGAY không đợi user mở app. Bật bằng env XSGO_RTDN_TOKEN +
+  // trỏ Pub/Sub push về .../billing/google/rtdn?token=<XSGO_RTDN_TOKEN>.
+  r.post('/billing/google/rtdn', (Request req) async {
+    final secret = Platform.environment['XSGO_RTDN_TOKEN'];
+    if (secret == null || secret.isEmpty) return bad('RTDN tắt', code: 404);
+    if (req.url.queryParameters['token'] != secret) {
+      return bad('Sai token', code: 403);
+    }
+    try {
+      final b = await readJson(req);
+      final data = (b['message'] as Map<String, dynamic>?)?['data'] as String?;
+      if (data != null) {
+        final n = jsonDecode(utf8.decode(base64.decode(data)))
+            as Map<String, dynamic>;
+        final voided =
+            n['voidedPurchaseNotification'] as Map<String, dynamic>?;
+        final token = ((n['subscriptionNotification']
+                    as Map<String, dynamic>?)?['purchaseToken'] ??
+                (n['oneTimeProductNotification']
+                    as Map<String, dynamic>?)?['purchaseToken'] ??
+                voided?['purchaseToken']) as String?;
+        final p = token == null ? null : db.purchaseByToken(token);
+        if (p != null) {
+          final uid = p['user_id'] as int;
+          final productId = p['product_id'] as String;
+          final entKey = catalog.entitlementOf(productId);
+          if (voided != null) {
+            // Hoàn tiền/void → thu hồi quyền ngay.
+            db.upsertPurchase(
+                token: token!,
+                userId: uid,
+                productId: productId,
+                kind: p['kind'] as String,
+                state: 'revoked',
+                expiryMs: 0);
+            if (entKey != null) db.revokeEntitlement(uid, entKey);
+          } else if (gplay.enabled) {
+            await applyVerified(uid, productId, token!);
+          }
+        }
+      }
+    } catch (e) {
+      stderr.writeln('[billing] RTDN lỗi: $e');
+    }
+    // LUÔN 200 — trả lỗi là Pub/Sub retry dồn dập.
+    return ok({'ok': true});
+  });
+
+  // -------- entitlements của chính mình (app kéo về sau login) --------
+  r.get('/me/entitlements', (Request req) async {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    // Subscription đã quá mốc hết hạn ghi nhận → hỏi lại Google (thường là đã
+    // GIA HẠN thành công → đẩy mốc mới; không thì quyền tự rơi). Không có RTDN
+    // vẫn tự lành theo cách này mỗi lần user mở app.
+    if (gplay.enabled) {
+      for (final p
+          in db.stalePurchasesOf(uid, DateTime.now().millisecondsSinceEpoch)) {
+        try {
+          await applyVerified(
+              uid, p['product_id'] as String, p['purchase_token'] as String);
+        } catch (e) {
+          stderr.writeln('[billing] re-verify lỗi: $e');
+        }
+      }
+    }
     return ok({'owned': db.userEntitlements(uid)});
+  });
+
+  // -------- quota XEM video Free (3h/tháng) --------
+  Map<String, dynamic> videoQuotaFor(int uid) {
+    final owned = db.userEntitlements(uid);
+    final unlimited = hasVideoPremium(owned);
+    final limit = cfgInt('video_free_month_sec', 10800); // 3 giờ
+    final used = db.videoUsedSec(uid, videoPeriodKey());
+    return {
+      'unlimited': unlimited,
+      'limitSec': limit,
+      'usedSec': used,
+      'remainingSec': unlimited ? -1 : (limit - used).clamp(0, limit),
+      'enforced': sellingEnabled(),
+    };
+  }
+
+  r.get('/me/video-quota', (Request req) {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    return ok(videoQuotaFor(uid));
+  });
+
+  // App báo số giây VỪA XEM THÊM (chỉ đếm lúc đang phát, không đếm pause).
+  // Server là sổ cái: restart app/đổi máy không reset được quota.
+  r.post('/me/video-usage', (Request req) async {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    // Flush mỗi ≥30s → 120 lần/giờ là quá đủ; chặn spam làm phình DB.
+    if (_limited('vu:u$uid', 240, 3600 * 1000)) {
+      return bad('Quá nhiều yêu cầu', code: 429);
+    }
+    final b = await readJson(req);
+    // Kẹp mỗi lần báo tối đa 10 phút — client flush 30s/lần, delta lớn hơn
+    // nghĩa là bịa số liệu.
+    final delta = ((b['deltaSec'] as num?)?.toInt() ?? 0).clamp(0, 600);
+    if (delta > 0 && !hasVideoPremium(db.userEntitlements(uid))) {
+      db.addVideoUsage(uid, videoPeriodKey(), delta);
+    }
+    return ok(videoQuotaFor(uid));
   });
 
   // Người dùng TỰ XOÁ tài khoản của mình + toàn bộ dữ liệu (App Store 5.1.1v
@@ -1488,7 +1744,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     'bjtPrice',
     'tokuteiPrice', // giá khóa Tokutei hiển thị ở màn mua (rỗng → mặc định)
     'saleBadge', // nhãn khuyến mãi ở màn mua, vd "🔥 Sale 8/8 · giảm 50%"
-    'premium_enabled'
+    'premium_enabled',
+    'selling_enabled', // công tắc bán hàng server (đồng bộ kSellingEnabled app)
   };
   r.get('/config', (Request req) {
     final all = db.allConfig();
@@ -1890,47 +2147,11 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   // HELPER: chạy pipeline tạo phụ đề cho 1 video: yt-dlp lấy audio → Groq
   // Whisper bóc tiếng + mốc thời gian → Claude thêm furigana → lưu. Nghĩa dịch
   // để luồng /translate lo (lazy) khi học viên mở. Cần GROQ + ANTHROPIC + yt-dlp/ffmpeg.
-  Future<Response> genSubtitles(int vid) async {
-    final v = db.video(vid);
-    if (v == null) return bad('Không tìm thấy video', code: 404);
-    final ytId = (v['youtube_id'] as String?) ?? '';
-    if (ytId.isEmpty) {
-      return bad('Video này không có link YouTube để tạo phụ đề', code: 422);
-    }
-
-    // 1) ƯU TIÊN: phụ đề tiếng Nhật CÓ SẴN của YouTube (nhẹ, né 403, khỏi Whisper).
-    var segs = await _fetchYoutubeCaptions(ytId);
-    var source = 'caption';
-
-    // 2) Không có caption → fallback Whisper (tải audio + bóc tiếng).
-    if (segs.isEmpty) {
-      if (!asr.enabled) {
-        return bad(
-            'Video này không có phụ đề tiếng Nhật sẵn, và chưa bật bóc tiếng '
-            '(cần GROQ_API_KEY). Thử video có phụ đề CC.',
-            code: 422);
-      }
-      final audio = await _downloadYoutubeAudio(ytId);
-      if (audio == null) {
-        return bad(
-            'Video không có phụ đề sẵn và không tải được audio để bóc tiếng '
-            '(YouTube chặn IP máy chủ). Thử video có phụ đề CC, hoặc cắm proxy/cookies.',
-            code: 502);
-      }
-      try {
-        segs = await asr.transcribe(audio, lang: 'ja');
-        source = 'whisper';
-      } finally {
-        try {
-          audio.parent.deleteSync(recursive: true);
-        } catch (_) {}
-      }
-    }
-
-    if (segs.isEmpty) {
-      return bad('Không lấy được câu phụ đề nào cho video này.', code: 422);
-    }
-
+  /// Chặng 3 của pipeline phụ đề, tách riêng để dùng lại: câu + mốc thời gian
+  /// (từ caption YouTube, Whisper, HOẶC caption json3 do máy khác đẩy lên) →
+  /// furigana + dịch lô đầu → lưu → dịch trọn video ở nền.
+  Future<Response> saveSubsFromSegs(
+      int vid, List<Map<String, dynamic>> segs, String source) async {
     // 3) Furigana + DỊCH tiếng Việt lô đầu (để mở xem ngay) + lưu.
     final jp = [for (final s in segs) s['text'] as String];
     final withFuri = await ai.furigana(jp);
@@ -1976,6 +2197,48 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     });
   }
 
+  Future<Response> genSubtitles(int vid) async {
+    final v = db.video(vid);
+    if (v == null) return bad('Không tìm thấy video', code: 404);
+    final ytId = (v['youtube_id'] as String?) ?? '';
+    if (ytId.isEmpty) {
+      return bad('Video này không có link YouTube để tạo phụ đề', code: 422);
+    }
+
+    // 1) ƯU TIÊN: phụ đề tiếng Nhật CÓ SẴN của YouTube (nhẹ, né 403, khỏi Whisper).
+    var segs = await _fetchYoutubeCaptions(ytId);
+    var source = 'caption';
+
+    // 2) Không có caption → fallback Whisper (tải audio + bóc tiếng).
+    if (segs.isEmpty) {
+      if (!asr.enabled) {
+        return bad(
+            'Video này không có phụ đề tiếng Nhật sẵn, và chưa bật bóc tiếng '
+            '(cần GROQ_API_KEY). Thử video có phụ đề CC.',
+            code: 422);
+      }
+      final audio = await _downloadYoutubeAudio(ytId);
+      if (audio == null) {
+        return bad(
+            'Video không có phụ đề sẵn và không tải được audio để bóc tiếng '
+            '(YouTube chặn IP máy chủ). Thử video có phụ đề CC, hoặc cắm proxy/cookies.',
+            code: 502);
+      }
+      try {
+        segs = await asr.transcribe(audio, lang: 'ja');
+        source = 'whisper';
+      } finally {
+        try {
+          audio.parent.deleteSync(recursive: true);
+        } catch (_) {}
+      }
+    }
+
+    if (segs.isEmpty) {
+      return bad('Không lấy được câu phụ đề nào cho video này.', code: 422);
+    }
+    return saveSubsFromSegs(vid, segs, source);
+  }
 
   // PHỤ ĐỀ HÀNG LOẠT: quét video chưa có phụ đề thật → tạo TUẦN TỰ ở nền
   // (caption-first, không phụ thuộc admin còn mở app). Trả về số video xếp hàng.
@@ -2013,6 +2276,35 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       }
     }());
     return ok({'queued': missing.length});
+  });
+
+  // NHẬN CAPTION TỪ MÁY KHÁC: YouTube chặn IP trung tâm dữ liệu nên
+  // `yt-dlp` chạy TRÊN SERVER thường về tay không (403). Máy ở nhà/máy dev thì
+  // tải được → chạy `scripts/push_captions_local.py` để đẩy nguyên file
+  // caption **json3** lên đây; server vẫn dùng CHUNG pipeline (ngắt câu theo
+  // nhịp đọc → furigana → dịch nền) nên phụ đề giống hệt đường tự động.
+  r.post('/admin/videos/<id|[0-9]+>/captions-json3',
+      (Request req, String id) async {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    final vid = int.parse(id);
+    if (db.video(vid) == null) return bad('Không tìm thấy video', code: 404);
+    final b = await readJson(req);
+    final raw = b['json3'];
+    final data = raw is Map<String, dynamic>
+        ? raw
+        : (raw is String
+            ? (jsonDecode(raw) as Map<String, dynamic>)
+            : <String, dynamic>{});
+    if (data.isEmpty) {
+      return bad('Thiếu nội dung caption json3 (field "json3").');
+    }
+    final segs = parseJson3Captions(data);
+    if (segs.isEmpty) {
+      return bad('Caption json3 không có câu tiếng Nhật nào đọc được.',
+          code: 422);
+    }
+    return saveSubsFromSegs(vid, segs, 'caption-push');
   });
 
   // Admin tạo phụ đề cho bất kỳ video nào.

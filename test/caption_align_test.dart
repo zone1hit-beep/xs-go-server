@@ -290,6 +290,34 @@ void main() {
       expect(out.first['text'], '今日はいい天気');
     });
 
+
+    test('KHÔNG cắt ngay trước TRỢ TỪ (の を が は に…)', () {
+      final out = parseJson3Captions(run([
+        'バイト', 'サイズ', 'ジャパニーズ', 'の', 'レーラ', 'です',
+        'よろしく', 'お願い', 'いたし', 'ます', 'ね',
+      ]));
+      for (final s in out) {
+        final t = s['text'] as String;
+        for (final joshi in ['の', 'を', 'が', 'は', 'に', 'で', 'と']) {
+          expect(t.startsWith(joshi), isFalse,
+              reason: 'dòng "$t" mở đầu bằng trợ từ "$joshi" → cắt sai chỗ');
+        }
+      }
+    });
+
+    test('KHÔNG tách danh từ phụ thuộc (時 / こと) khỏi mệnh đề trước', () {
+      final out = parseJson3Captions(run([
+        '私', 'が', 'バリ', 'に', '行った', '時', 'の', '話', 'を',
+        'し', 'たい', 'と', '思い', 'ます', 'けど', 'いい', 'ですか',
+      ]));
+      for (final s in out) {
+        final t = s['text'] as String;
+        expect(t.startsWith('時'), isFalse,
+            reason: 'dòng "$t" tách 時 khỏi mệnh đề đứng trước');
+        expect(t.startsWith('こと'), isFalse, reason: 'dòng "$t"');
+      }
+    });
+
     test('ưu tiên cắt SAU hết vế câu thay vì giữa vế', () {
       // Đủ dài để BUỘC phải chia (>26 chữ), có ranh giới vế rõ ở ました.
       final out = parseJson3Captions(run([
