@@ -640,6 +640,24 @@ Future<void> _translateWholeVideo(Db db, Ai ai, int vid, String lang) async {
 /// Ký tự ngăn cách `meaning` và `reading` trong một ô cache tra từ.
 const String _dictSep = '\u0001';
 
+/// Có PHẢI CHẶN lượt đăng nhập social này vì đụng email admin không.
+///
+/// Cho phép đúng MỘT khe cho chính chủ: (1) nhà cung cấp khẳng định email đã
+/// xác minh — Apple/Google đều bắt nhập mã gửi về hộp thư khi gắn email vào
+/// tài khoản, nên "đã xác minh" = người đó sở hữu hộp thư admin; và (2) tài
+/// khoản admin đã tồn tại sẵn trong DB — đường social chỉ GẮN THÊM cách đăng
+/// nhập, không bao giờ TẠO MỚI tài khoản mang email admin (tạo mới chỉ qua
+/// /auth/register có XSGO_ADMIN_BOOTSTRAP). Email khác admin: không chặn.
+bool blockAdminSocial({
+  required String? email,
+  required bool emailVerified,
+  required String adminEmail,
+  required bool adminAccountExists,
+}) {
+  if (email == null || email != adminEmail) return false;
+  return !emailVerified || !adminAccountExists;
+}
+
 Router buildRouter(Db db, Ai ai, Asr asr) {
   final r = Router();
 
@@ -1089,11 +1107,19 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
           'chưa cấu hình khoá cho nhà cung cấp này).',
           code: 401);
     }
-    // ⛔ CHẶN CHIẾM QUYỀN ADMIN: `ensureRole` tự nâng quyền cho user mang
-    // email admin, nên đường social KHÔNG được tạo/đăng nhập vào email đó
-    // (route /auth/register cũng chặn tương tự, phải có bootstrap secret).
+    // ⛔ EMAIL ADMIN: trước 11/8 chặn thẳng mọi lượt social mang email này
+    // (chống chiếm quyền) — nhưng chặn luôn cả CHÍNH CHỦ đăng nhập Apple/Google
+    // bằng gmail admin. Nay nới đúng một khe (sếp duyệt 11/8, xem
+    // blockAdminSocial): nhà cung cấp đã XÁC MINH quyền sở hữu hộp thư + tài
+    // khoản admin ĐÃ TỒN TẠI (chỉ gắn thêm cách đăng nhập vào tài khoản sẵn có;
+    // tạo mới tài khoản admin vẫn CHỈ qua /auth/register + bootstrap secret).
+    // Không có nâng quyền ở đây: role đọc từ DB như mọi lần đăng nhập khác.
     final socialEmail = id.email?.trim().toLowerCase();
-    if (socialEmail != null && socialEmail == adminEmail) {
+    if (blockAdminSocial(
+        email: socialEmail,
+        emailVerified: id.emailVerified,
+        adminEmail: adminEmail,
+        adminAccountExists: db.userByEmail(adminEmail) != null)) {
       return bad('Không được phép', code: 403);
     }
     // Email lấy TỪ NHÀ CUNG CẤP (đã xác thực); nếu họ không trả (Facebook,
