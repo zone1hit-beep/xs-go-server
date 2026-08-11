@@ -4,7 +4,9 @@
 #
 
 app = 'xs-go-server'
-primary_region = 'sin'
+# sjc (San Jose): khu vực gần Nhật NHẤT mà YouTube không chặn tải phụ đề
+# (sin/nrt đều bị "Sign in to confirm you're not a bot" — đo thực tế 10-11/8/2026).
+primary_region = 'sjc'
 
 [build]
 [env]

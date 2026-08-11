@@ -124,24 +124,6 @@ class Ai {
     return out;
   }
 
-  /// Trả lời hội thoại luyện nói (AI đóng vai bạn nói chuyện theo tình huống).
-  Future<String> speakingReply(
-      String scenario, String userMessage, String lang) async {
-    if (!enabled) {
-      return 'そうですね！「$userMessage」いいですね。もっと話しましょう。'
-          '\n(AI luyện nói bản demo — bật ANTHROPIC_API_KEY để trả lời thật)';
-    }
-    final target = _langNames[lang] ?? lang;
-    final prompt =
-        'You are a friendly Japanese conversation partner in a JLPT practice app. '
-        'Scenario: "$scenario". The learner is a beginner whose native language is '
-        '$target. Reply in short, natural Japanese (1-2 sentences), then on a new '
-        'line give a brief $target translation in parentheses. Keep it encouraging.\n\n'
-        'Learner said: $userMessage';
-    return await _message(prompt, maxTokens: 512) ??
-        'すみません、もう一度お願いします。';
-  }
-
   /// Thêm furigana cho câu tiếng Nhật: chỉ gắn cách đọc cho phần Hán tự theo
   /// ký hiệu `[漢字|かな]` để app tách token bấm-tra-được. Trả về cùng độ dài;
   /// fallback (chưa có key) → giữ nguyên câu (không có furigana).

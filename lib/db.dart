@@ -263,6 +263,8 @@ class Db {
         })
       ],
     );
+    // ---- SỬA DỮ LIỆU CŨ: video chưa có phụ đề bị gán "dài 60 giây" ----
+    fixPlaceholderDurations();
     // INDEX cho các truy vấn nóng — bắt buộc khi dữ liệu lớn (100k user):
     // không có thì mỗi lần mở video / xem thống kê là full-table-scan.
     _db.execute(
@@ -448,8 +450,41 @@ class Db {
         'UPDATE users SET disabled = ? WHERE id = ?', [disabled ? 1 : 0, userId]);
   }
 
+  /// Xoá tài khoản + TOÀN BỘ dữ liệu người dùng.
+  ///
+  /// FK ON DELETE CASCADE chỉ dọn được: progress, vocab, entitlements,
+  /// purchases (và sentences/video_reports theo video). Các bảng KHÔNG có khoá
+  /// ngoại tới users phải xoá TAY ở đây — thiếu là dữ liệu cá nhân (kể cả email
+  /// trong feedback) ở lại vĩnh viễn, vi phạm cam kết "xoá toàn bộ dữ liệu".
   void deleteUser(int userId) {
-    _db.execute('DELETE FROM users WHERE id = ?', [userId]);
+    _db.execute('BEGIN');
+    try {
+      // Video user tự thêm → xoá (sentences/video_reports cascade theo video).
+      _db.execute('DELETE FROM videos WHERE owner_user_id = ?', [userId]);
+      // Các bảng không có FK tới users:
+      for (final t in const [
+        'watch_history',
+        'ai_usage',
+        'video_usage',
+        'import_log',
+      ]) {
+        _db.execute('DELETE FROM $t WHERE user_id = ?', [userId]);
+      }
+      // Chặn/bị chặn 2 chiều.
+      _db.execute(
+          'DELETE FROM user_blocks WHERE user_id = ? OR blocked_id = ?',
+          [userId, userId]);
+      // Báo cáo do người này gửi (reporter_id không có FK).
+      _db.execute('DELETE FROM video_reports WHERE reporter_id = ?', [userId]);
+      // Feedback: xoá hẳn phản hồi + email đính kèm của người này.
+      _db.execute('DELETE FROM feedback WHERE user_id = ?', [userId]);
+      // Cuối cùng xoá user — CASCADE dọn progress/vocab/entitlements/purchases.
+      _db.execute('DELETE FROM users WHERE id = ?', [userId]);
+      _db.execute('COMMIT');
+    } catch (e) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
   }
 
   /// Danh sách người dùng kèm tiến độ + số từ + khóa sở hữu (cho trang admin).
@@ -738,15 +773,19 @@ class Db {
 
   /// Ghi báo cáo 1 video. Khi số người báo (khác nhau) >= [threshold] thì TỰ ẨN
   /// video khỏi Khám phá (kiểm duyệt tự động). Trả true nếu vừa bị ẩn.
+  /// Ghi 1 báo cáo. [countsToward] = false (khách chưa đăng nhập) vẫn LƯU báo
+  /// cáo cho admin xem nhưng KHÔNG kích hoạt tự ẩn (chống 3 khách nặc danh ẩn
+  /// sạch nội dung). Chỉ báo cáo của tài khoản đã đăng nhập mới tính ngưỡng.
   bool reportVideo(int videoId, int? reporterId, String reason,
-      {int threshold = 3}) {
+      {int threshold = 3, bool countsToward = true}) {
     _db.execute(
         'INSERT OR IGNORE INTO video_reports '
         '(video_id, reporter_id, reason, created_at) VALUES (?,?,?,?)',
         [videoId, reporterId, reason, DateTime.now().millisecondsSinceEpoch]);
+    if (!countsToward) return false;
     final c = _db.select(
-        'SELECT COUNT(DISTINCT COALESCE(reporter_id, id)) n '
-        'FROM video_reports WHERE video_id = ?',
+        'SELECT COUNT(DISTINCT reporter_id) n '
+        'FROM video_reports WHERE video_id = ? AND reporter_id IS NOT NULL',
         [videoId]).first['n'] as int;
     if (c >= threshold) {
       // Chỉ TỰ ẨN video cộng đồng — video chính thức bị báo cáo thì chờ admin
@@ -986,8 +1025,40 @@ class Db {
     return r.isNotEmpty;
   }
 
+  /// Câu phụ đề GIẢ chèn kèm khi tạo video (giữ màn Study không rỗng cho tới
+  /// khi có phụ đề thật). Nhận diện video "chưa có phụ đề" đều dựa vào hằng này.
+  static const kSubPlaceholder = '字幕はまだありません';
+
+  /// Đưa video CHƯA có phụ đề thật (chỉ có câu placeholder) về duration 0.
+  ///
+  /// Trước 11/8/2026 câu placeholder có end_ms=60000 và video duration_ms=60000
+  /// → app lấy mốc cuối của phụ đề làm độ dài bài, nên video 20 phút tự bắn
+  /// màn "đã học xong bài" sau đúng 1 phút. Đưa cả hai về 0 để app biết
+  /// "chưa có phụ đề" thay vì "bài dài 1 phút". Tách thành hàm để test được.
+  void fixPlaceholderDurations() {
+    _db.execute(
+        'UPDATE sentences SET end_ms = 0 WHERE text_jp = ? AND end_ms <> 0',
+        [kSubPlaceholder]);
+    _db.execute(
+        'UPDATE videos SET duration_ms = 0 WHERE duration_ms > 0 AND NOT EXISTS '
+        '(SELECT 1 FROM sentences s WHERE s.video_id = videos.id AND s.text_jp <> ?)',
+        [kSubPlaceholder]);
+  }
+
+  /// Video đã có phụ đề THẬT chưa (có ít nhất 1 câu không phải placeholder).
+  bool videoHasRealSubs(int videoId) {
+    final r = _db.select(
+        'SELECT 1 FROM sentences WHERE video_id = ? AND text_jp <> ? LIMIT 1',
+        [videoId, kSubPlaceholder]);
+    return r.isNotEmpty;
+  }
+
   /// Tạo video người dùng thêm (YouTube). Kèm 1 câu placeholder để màn Study
   /// hoạt động; phụ đề AI (ASR) là tính năng sau.
+  ///
+  /// ⚠️ duration_ms và end_ms của câu placeholder đều = 0 CÓ CHỦ Ý: app tính
+  /// "đã học xong bài" theo mốc cuối của phụ đề, nên mọi giá trị > 0 (trước đây
+  /// là 60000) sẽ khiến video dài 20 phút tự báo hoàn thành sau 1 phút.
   int createVideo({
     required String title,
     required String channel,
@@ -1000,7 +1071,7 @@ class Db {
   }) {
     _db.execute(
       'INSERT INTO videos (title, channel, level, color, youtube_id, duration_ms, owner_user_id, is_official, yt_title, yt_channel) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      [title, channel, level, 0xFF0EA5E9, youtubeId, 60000, ownerUserId, official ? 1 : 0, ytTitle, ytChannel],
+      [title, channel, level, 0xFF0EA5E9, youtubeId, 0, ownerUserId, official ? 1 : 0, ytTitle, ytChannel],
     );
     final vid = _db.lastInsertRowId;
     _db.execute(
@@ -1009,10 +1080,10 @@ class Db {
         vid,
         0,
         0,
-        60000,
-        '字幕はまだありません',
+        0, // end_ms = 0 → app KHÔNG coi đây là video dài 60 giây
+        kSubPlaceholder,
         jsonEncode([
-          {'surface': '字幕はまだありません', 'tappable': false}
+          {'surface': kSubPlaceholder, 'tappable': false}
         ]),
         '[]',
         // KHÔNG hứa tính năng tương lai ở đây: câu này hiện trong app nên phải

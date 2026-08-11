@@ -112,4 +112,81 @@ void main() {
       expect(db.importCount(uid, '2026-08-11'), 0); // sang ngày tự reset
     });
   });
+
+  group('B1 — video chưa có phụ đề thật', () {
+    late Db db;
+    late int uid;
+    setUp(() {
+      db = Db.open(':memory:');
+      uid = db.createUser('t@xsgo.app', 'x', 'vi', 'N5');
+    });
+
+    test('video mới chỉ có câu placeholder → videoHasRealSubs=false, duration=0',
+        () {
+      final vid = db.createVideo(
+          title: 'T', channel: 'C', level: 'N5', youtubeId: 'abcdefghijk',
+          ownerUserId: uid);
+      expect(db.videoHasRealSubs(vid), isFalse);
+      // endMs của câu placeholder = 0 → app không coi là "bài dài 60 giây".
+      final v = db.video(vid)!;
+      expect(v['duration_ms'], 0);
+    });
+
+    test('câu placeholder có end_ms=0 (không bị coi là bài dài 60 giây)', () {
+      final vid = db.createVideo(
+          title: 'T', channel: 'C', level: 'N5', youtubeId: 'abcdefghijk',
+          ownerUserId: uid);
+      final sents = db.sentences(vid);
+      expect(sents, hasLength(1));
+      expect(sents.first['end_ms'], 0);
+      // fixPlaceholderDurations idempotent — chạy lại không đổi gì.
+      db.fixPlaceholderDurations();
+      expect(db.video(vid)!['duration_ms'], 0);
+    });
+  });
+
+  group('H3 — xoá tài khoản xoá HẾT dữ liệu', () {
+    test('deleteUser dọn cả bảng không có khoá ngoại', () {
+      final db = Db.open(':memory:');
+      final uid = db.createUser('gone@xsgo.app', 'x', 'vi', 'N5');
+      // Rải dữ liệu ở các bảng KHÔNG có FK tới users.
+      db.addVideoUsage(uid, 'V:2026-08', 100);
+      db.addImport(uid, '2026-08-11');
+      db.addFeedback(userId: uid, email: 'gone@xsgo.app', category: 'bug', message: 'test');
+      final vid = db.createVideo(
+          title: 'mine', channel: 'C', level: 'N5', youtubeId: 'abcdefghijk',
+          ownerUserId: uid);
+      db.grantEntitlement(uid, 'bjt_lifetime');
+
+      db.deleteUser(uid);
+
+      expect(db.videoUsedSec(uid, 'V:2026-08'), 0);
+      expect(db.importCount(uid, '2026-08-11'), 0);
+      expect(db.userEntitlements(uid), isEmpty);
+      expect(db.video(vid), isNull); // video của user bị xoá
+      // Không còn feedback (kèm email) của người này.
+      expect(db.feedbackList().where((f) => f['user_id'] == uid), isEmpty);
+    });
+  });
+
+  group('H5 — báo cáo UGC cho khách', () {
+    test('khách (reporterId null) lưu báo cáo nhưng KHÔNG tự ẩn', () {
+      final db = Db.open(':memory:');
+      final owner = db.createUser('o@xsgo.app', 'x', 'vi', 'N5');
+      final vid = db.createVideo(
+          title: 'v', channel: 'C', level: 'N5', youtubeId: 'abcdefghijk',
+          ownerUserId: owner);
+      // 5 khách nặc danh báo cáo — không được tự ẩn video.
+      for (var i = 0; i < 5; i++) {
+        final hidden = db.reportVideo(vid, null, 'spam', countsToward: false);
+        expect(hidden, isFalse);
+      }
+      // 3 TÀI KHOẢN báo cáo → tự ẩn.
+      for (var i = 0; i < 3; i++) {
+        final u = db.createUser('u$i@xsgo.app', 'x', 'vi', 'N5');
+        db.reportVideo(vid, u, 'spam');
+      }
+      expect(db.video(vid)!['hidden'], 1);
+    });
+  });
 }

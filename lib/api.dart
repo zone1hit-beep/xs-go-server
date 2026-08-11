@@ -773,7 +773,6 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       'remainingSec': remaining,
       'period': periodKey,
       'costTranslateSec': cfgInt('ai_cost_translate_sec', 20),
-      'costSpeakingSec': cfgInt('ai_cost_speaking_sec', 45),
     };
   }
 
@@ -859,6 +858,12 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   r.get('/health', (Request req) => ok({'ok': true, 'ai': ai.enabled}));
 
   // -------- trang pháp lý CÔNG KHAI (URL cho hồ sơ App Store / Google Play) --------
+  // Email hỗ trợ hiển thị công khai. Đổi KHÔNG cần sửa code:
+  //   fly secrets set XSGO_SUPPORT_EMAIL=... -a xs-go-server
+  final supportEmail =
+      (Platform.environment['XSGO_SUPPORT_EMAIL'] ?? 'zone1hit@gmail.com')
+          .trim();
+
   Response htmlPage(String title, String body) => Response.ok(
         '<!doctype html><html lang="vi"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -869,40 +874,122 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         'a{color:#2563EB}</style></head><body>$body'
         '<hr style="margin:32px 0;border:none;border-top:1px solid #ddd">'
         '<p style="color:#888;font-size:.85rem">XS GO — Học tiếng Nhật. '
-        'Liên hệ: hotro@xsgo.app</p></body></html>',
+        'Nhà phát triển: XS GO. Liên hệ: '
+        '<a href="mailto:$supportEmail">$supportEmail</a></p></body></html>',
         headers: {'content-type': 'text/html; charset=utf-8'},
       );
 
   r.get('/privacy', (Request req) => htmlPage('Chính sách bảo mật', '''
-    <h1>Chính sách bảo mật</h1><p>Cập nhật: 08/2026</p>
+    <h1>Chính sách bảo mật</h1><p>Cập nhật: 11/08/2026</p>
+    <p><strong>Nhà phát triển:</strong> XS GO. <strong>Liên hệ:</strong>
+    <a href="mailto:$supportEmail">$supportEmail</a></p>
     <h2>1. Thông tin thu thập</h2><p>Email (khi đăng ký), ngôn ngữ mẹ đẻ, trình độ,
-    tiến độ học (streak, số từ, bài đã học) và kho từ vựng bạn lưu. Đăng nhập bằng
-    Google/Apple/Facebook: nhận email và mã định danh do nhà cung cấp cấp.</p>
+    tiến độ học (streak, số từ, bài đã học), kho từ vựng bạn lưu,
+    <strong>lịch sử xem video</strong> (để tiếp tục xem và đo hạn mức gói Free),
+    <strong>video YouTube bạn tự thêm</strong>, <strong>nội dung bạn nhập khi luyện
+    nói với AI</strong>, và <strong>lịch sử mua hàng</strong> (do Google Play xử lý).
+    Đăng nhập bằng Google/Apple: nhận email và mã định danh do nhà cung cấp cấp.</p>
+    <p>Chúng tôi <strong>KHÔNG</strong> thu thập vị trí, danh bạ, ảnh, và
+    <strong>KHÔNG</strong> dùng Advertising ID — ứng dụng không có quảng cáo.</p>
     <h2>2. Mục đích</h2><p>Đồng bộ tiến độ giữa các thiết bị, cá nhân hoá nội dung,
-    dịch nội dung sang ngôn ngữ của bạn, cải thiện khóa học. Chúng tôi KHÔNG bán dữ liệu.</p>
+    dịch nội dung sang ngôn ngữ của bạn, áp dụng hạn mức gói, cải thiện khóa học.
+    Chúng tôi KHÔNG bán dữ liệu và KHÔNG dùng dữ liệu để quảng cáo.</p>
     <h2>3. Nội dung bạn tạo</h2><p>Video YouTube bạn tự thêm có thể hiển thị ở mục
     Khám phá cộng đồng cho học viên dùng cùng ngôn ngữ (hiển thị theo tiêu đề gốc
     YouTube); video vi phạm hoặc bị báo cáo sẽ bị ẩn/gỡ.
     Phản hồi bạn gửi được lưu để xử lý.</p>
-    <h2>4. Lưu trữ &amp; bảo mật</h2><p>Dữ liệu lưu trên máy chủ XS GO; mật khẩu được băm.
+    <h2>4. Chia sẻ với bên thứ ba</h2><p>Chúng tôi gửi phần <em>văn bản cần xử lý</em>
+    tới các nhà cung cấp sau, không kèm danh tính của bạn:</p>
+    <ul>
+      <li><strong>Anthropic</strong> (dịch, giải thích, luyện nói bằng AI)</li>
+      <li><strong>Groq</strong> (nhận dạng giọng nói để tạo phụ đề)</li>
+      <li><strong>Google / YouTube</strong> (phát video nhúng, đăng nhập Google)</li>
+      <li><strong>Apple</strong> (đăng nhập Apple, nếu bạn chọn)</li>
+      <li><strong>Google Play</strong> (thanh toán trong ứng dụng — chúng tôi không
+          nhận và không lưu thông tin thẻ của bạn)</li>
+    </ul>
+    <h2>5. Lưu trữ &amp; bảo mật</h2><p>Dữ liệu lưu trên máy chủ XS GO (Fly.io,
+    khu vực Singapore); mật khẩu được băm; toàn bộ kết nối dùng HTTPS.
     Áp dụng biện pháp bảo vệ hợp lý nhưng không hệ thống nào an toàn tuyệt đối.</p>
-    <h2>5. Quyền của bạn</h2><p>Bạn có thể XOÁ tài khoản và toàn bộ dữ liệu ngay trong app
-    (Hồ sơ → Xoá tài khoản), hoặc liên hệ hotro@xsgo.app.</p>
-    <h2>6. Dịch vụ bên thứ ba</h2><p>Video nhúng từ YouTube (theo điều khoản YouTube).
-    Bản dịch/AI xử lý qua nhà cung cấp AI; chỉ gửi phần văn bản cần xử lý.</p>'''));
+    <h2>6. Quyền của bạn — xoá dữ liệu</h2><p>Bạn có thể XOÁ tài khoản và toàn bộ dữ liệu
+    ngay trong app (Hồ sơ → Xoá tài khoản), hoặc gửi yêu cầu theo hướng dẫn ở trang
+    <a href="/delete-account">Xoá tài khoản &amp; dữ liệu</a>. Chúng tôi xử lý trong
+    vòng 30 ngày.</p>
+    <h2>7. Trẻ em</h2><p>Ứng dụng dành cho người từ 16 tuổi trở lên và không hướng tới trẻ em.</p>'''));
 
   r.get('/terms', (Request req) => htmlPage('Điều khoản sử dụng', '''
-    <h1>Điều khoản sử dụng</h1><p>Cập nhật: 07/2026</p>
+    <h1>Điều khoản sử dụng</h1><p>Cập nhật: 11/08/2026</p>
     <h2>1. Chấp nhận</h2><p>Sử dụng XS GO nghĩa là bạn đồng ý các điều khoản này.</p>
-    <h2>2. Tài khoản</h2><p>Bạn tự bảo mật tài khoản/mật khẩu và cung cấp thông tin chính xác.</p>
+    <h2>2. Tài khoản</h2><p>Bạn tự bảo mật tài khoản/mật khẩu và cung cấp thông tin chính xác.
+    Bạn có thể xoá tài khoản bất cứ lúc nào — xem
+    <a href="/delete-account">Xoá tài khoản &amp; dữ liệu</a>.</p>
     <h2>3. Bản quyền nội dung</h2><p>Nội dung khóa học thuộc XS GO, dùng cho học cá nhân,
     không sao chép/bán lại khi chưa được phép. Video thuộc bản quyền của chủ kênh YouTube.</p>
-    <h2>4. Nội dung bạn thêm</h2><p>Khi thêm video, bạn xác nhận có quyền xem/chia sẻ; video
-    bạn thêm có thể hiển thị ở mục Khám phá cộng đồng cho học viên khác và sẽ bị ẩn/gỡ
-    nếu bị báo cáo hoặc vi phạm.</p>
-    <h2>5. Thanh toán</h2><p>Một số khóa có thể trả phí; giá áp dụng là giá tại thời điểm mua.</p>
+    <h2>4. Nội dung bạn thêm &amp; quy tắc cộng đồng</h2><p>Khi thêm video, bạn xác nhận có
+    quyền xem/chia sẻ; video bạn thêm <strong>có thể hiển thị công khai</strong> ở mục Khám phá
+    cho học viên khác. <strong>NGHIÊM CẤM</strong> thêm nội dung: khiêu dâm hoặc gợi dục;
+    bạo lực, máu me, khủng bố; thù ghét, phân biệt đối xử, quấy rối, bắt nạt; ma tuý, vũ khí,
+    cờ bạc; lừa đảo, spam; nội dung vi phạm bản quyền; nội dung gây hại cho trẻ em.
+    Vi phạm sẽ bị gỡ nội dung và khoá tài khoản vĩnh viễn, không hoàn tiền.
+    Mọi người dùng có thể báo cáo nội dung ngay trong ứng dụng (nút cờ 🚩 ở màn xem video);
+    chúng tôi xem xét và xử lý trong vòng 24–48 giờ.</p>
+    <h2>5. Gói trả phí &amp; thanh toán</h2>
+    <p>Thanh toán thực hiện qua <strong>Google Play</strong>. Giá áp dụng là giá hiển thị tại
+    thời điểm mua, đã bao gồm thuế theo quy định của Google Play.</p>
+    <ul>
+      <li><strong>Video Premium theo tháng</strong> — ¥1.500/tháng, <strong>tự động gia hạn</strong>
+          mỗi tháng cho tới khi bạn huỷ.</li>
+      <li><strong>Video Premium theo năm</strong> — ¥9.999/năm, <strong>tự động gia hạn</strong>
+          mỗi năm cho tới khi bạn huỷ.</li>
+      <li><strong>Khoá BJT</strong> — ¥7.999, mua một lần, dùng trọn đời.</li>
+      <li><strong>Tokutei theo ngành</strong> — ¥9.999/ngành, mua một lần, dùng trọn đời.</li>
+      <li><strong>All Access</strong> — ¥19.999, mua một lần, mở toàn bộ, dùng trọn đời.</li>
+    </ul>
+    <p><strong>Huỷ gia hạn:</strong> mở ứng dụng Google Play → ảnh đại diện →
+    Thanh toán và gói đăng ký → Gói đăng ký → chọn XS GO → Huỷ. Việc huỷ có hiệu lực từ
+    chu kỳ kế tiếp; bạn vẫn dùng được tới hết chu kỳ đã trả tiền.
+    <strong>Hoàn tiền</strong> theo chính sách của Google Play; bạn cũng có thể liên hệ
+    <a href="mailto:$supportEmail">$supportEmail</a> để được hỗ trợ.
+    Gói Free được xem tối đa 3 giờ video mỗi tháng, tự làm mới vào đầu tháng.</p>
     <h2>6. Giới hạn trách nhiệm</h2><p>XS GO là công cụ hỗ trợ học, không cam kết kết quả thi
     cụ thể; dịch vụ có thể thay đổi hoặc gián đoạn.</p>'''));
+
+  // Trang XOÁ TÀI KHOẢN công khai — Google Play BẮT BUỘC với app cho tạo tài
+  // khoản: người dùng phải yêu cầu xoá được mà KHÔNG cần cài app.
+  r.get('/delete-account', (Request req) => htmlPage('Xoá tài khoản & dữ liệu', '''
+    <h1>Xoá tài khoản &amp; dữ liệu — XS GO</h1>
+    <p>Ứng dụng: <strong>XS GO</strong> (com.xsgo.xs_go). Nhà phát triển: XS GO.</p>
+    <h2>Cách 1 — xoá ngay trong ứng dụng (nhanh nhất)</h2>
+    <ol>
+      <li>Mở XS GO → thẻ <strong>Hồ sơ</strong>.</li>
+      <li>Kéo xuống mục <strong>Tài khoản</strong> → bấm <strong>Xoá tài khoản</strong>.</li>
+      <li>Xác nhận. Tài khoản và dữ liệu bị xoá <strong>ngay lập tức</strong>.</li>
+    </ol>
+    <h2>Cách 2 — gửi yêu cầu qua email (không cần cài app)</h2>
+    <p>Gửi email tới <a href="mailto:$supportEmail">$supportEmail</a> với tiêu đề
+    <strong>"Xoá tài khoản XS GO"</strong>, kèm địa chỉ email bạn đã dùng để đăng ký.
+    Chúng tôi xác minh và xoá trong vòng <strong>30 ngày</strong>, và báo lại khi xong.</p>
+    <h2>Dữ liệu bị XOÁ VĨNH VIỄN</h2>
+    <ul>
+      <li>Tài khoản và email đăng nhập</li>
+      <li>Tiến độ học, streak, mục tiêu</li>
+      <li>Kho từ vựng đã lưu</li>
+      <li>Lịch sử xem video và hạn mức đã dùng</li>
+      <li>Video bạn tự thêm</li>
+      <li>Phản hồi/báo cáo bạn đã gửi (email trong phản hồi được xoá)</li>
+      <li>Quyền sở hữu khoá học đã mua</li>
+    </ul>
+    <h2>Dữ liệu được GIỮ LẠI và lý do</h2>
+    <ul>
+      <li><strong>Hoá đơn/giao dịch do Google Play lưu giữ</strong> — chúng tôi không
+          kiểm soát; giữ theo yêu cầu kế toán và chống gian lận của Google.
+          Xem <a href="https://policies.google.com/privacy">chính sách của Google</a>.</li>
+      <li><strong>Nhật ký máy chủ ẩn danh</strong> (không chứa danh tính) — tối đa 30 ngày.</li>
+    </ul>
+    <p style="background:#FEF3C7;padding:12px;border-radius:8px">
+    ⚠️ <strong>Lưu ý:</strong> xoá tài khoản sẽ mất quyền truy cập các khoá học đã mua và
+    <strong>không thể khôi phục</strong>. Nếu bạn chỉ muốn ngừng gói đăng ký, hãy huỷ trong
+    Google Play thay vì xoá tài khoản.</p>'''));
 
   // -------- auth --------
   r.post('/auth/register', (Request req) async {
@@ -1147,12 +1234,22 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   });
 
   // Báo cáo 1 video cộng đồng (cần đăng nhập). Đủ số báo cáo → tự ẩn.
+  // Báo cáo video — KHÔNG bắt đăng nhập: khách chưa đăng nhập vẫn xem được
+  // video cộng đồng ở Khám phá nên phải báo cáo được (chính sách UGC của
+  // Google Play). Người đã đăng nhập: gắn reporter_id để mỗi người báo 1 lần.
+  // Khách: chống spam theo IP (10 báo cáo/giờ/IP), không đếm vào ngưỡng tự ẩn.
   r.post('/videos/<id|[0-9]+>/report', (Request req, String id) async {
+    final vid = int.parse(id);
+    if (db.video(vid) == null) return bad('Không tìm thấy video', code: 404);
     final uid = authUserId(req);
-    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    if (uid == null && _limited('report:${_clientIp(req)}', 10, 3600 * 1000)) {
+      return bad('Quá nhiều báo cáo, thử lại sau', code: 429);
+    }
     final body = await readJson(req);
     final reason = (body['reason'] as String?)?.trim() ?? '';
-    final hidden = db.reportVideo(int.parse(id), uid, reason);
+    // Khách gửi reporterId null → reportVideo dùng id bản ghi làm khoá đếm,
+    // nhưng chỉ báo cáo của TÀI KHOẢN mới đủ tin cậy để tự ẩn (threshold).
+    final hidden = db.reportVideo(vid, uid, reason, countsToward: uid != null);
     return ok({'ok': true, 'hidden': hidden});
   });
 
@@ -1230,6 +1327,10 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       'durationMs': v['duration_ms'],
       'youtubeId': v['youtube_id'],
       'sentences': sentences,
+      // Video đã có phụ đề THẬT chưa. App dựa vào CỜ NÀY (không đoán bằng cách
+      // so chuỗi tiếng Nhật) để hiện trạng thái "phụ đề đang được chuẩn bị"
+      // thay vì màn học rỗng, và để KHÔNG tính "đã học xong bài".
+      'hasSubtitles': db.videoHasRealSubs(int.parse(id)),
       // Số câu CHƯA có bản dịch [lang] — app dựa vào đây để tự tải lại bản
       // dịch trong lúc xem (job nền trên máy chủ đang dịch dần).
       'pending': db.pendingTranslationCount(int.parse(id), lang),
@@ -1360,32 +1461,21 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         {'lang': lang, 'translations': result, 'remaining': pendingCount});
   });
 
-  // -------- speaking --------
-  r.get('/speaking/scenarios', (Request req) {
-    return ok({
-      'scenarios': [
-        {'id': 'self_intro', 'title': '自己紹介', 'sub': 'Giới thiệu bản thân', 'level': 'N5'},
-        {'id': 'restaurant', 'title': 'レストランで', 'sub': 'Ở nhà hàng', 'level': 'N4'},
-        {'id': 'shopping', 'title': '買い物', 'sub': 'Đi mua sắm', 'level': 'N4'},
-        {'id': 'interview', 'title': '面接', 'sub': 'Phỏng vấn xin việc', 'level': 'N3'},
-      ]
-    });
-  });
-
-  r.post('/speaking', (Request req) async {
-    final b = await readJson(req);
-    final scenario = (b['scenario'] as String?) ?? 'hội thoại chung';
-    final message = (b['message'] as String?) ?? '';
-    final lang = (b['lang'] as String?) ?? 'vi';
-    if (message.isEmpty) return bad('Thiếu nội dung');
-    if (message.length > 2000) return bad('Nội dung quá dài (tối đa 2000 ký tự)', code: 413);
-    final g = aiGuard(req);
-    if (g != null) return g;
-    final gl = aiLimitGuard(authUserId(req), cfgInt('ai_cost_speaking_sec', 45));
-    if (gl != null) return gl;
-    final reply = await ai.speakingReply(scenario, message, lang);
-    return ok({'reply': reply});
-  });
+  // -------- luyện nói: ĐÃ GỠ (11/8/2026) --------
+  // Tính năng hội thoại AI dùng model chính (Opus) và tốn tới ~12 USD/tháng cho
+  // một học viên premium dùng hết hạn mức 1 giờ/ngày — cao hơn cả tiền gói
+  // ¥1.500/tháng. Sếp chốt bỏ hẳn. Giữ 2 route trả 410 để BẢN APP CŨ đã cài trên
+  // máy học viên không gọi vào khoảng trống (và không đốt tiền nữa).
+  Response _speakingGone() => Response(
+        410,
+        body: jsonEncode({
+          'error': 'Tính năng luyện nói AI đã được gỡ khỏi XS GO. '
+              'Hãy cập nhật app lên bản mới nhất.'
+        }),
+        headers: {'content-type': 'application/json; charset=utf-8'},
+      );
+  r.get('/speaking/scenarios', (Request req) => _speakingGone());
+  r.post('/speaking', (Request req) => _speakingGone());
 
   // -------- localization: dịch chuỗi giao diện/giáo trình sang ngôn ngữ user --------
   // Dùng chung cho giáo trình BJT & nội dung tĩnh khác. Cache theo hash để mỗi
@@ -2151,10 +2241,14 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   /// (từ caption YouTube, Whisper, HOẶC caption json3 do máy khác đẩy lên) →
   /// furigana + dịch lô đầu → lưu → dịch trọn video ở nền.
   Future<Response> saveSubsFromSegs(
-      int vid, List<Map<String, dynamic>> segs, String source) async {
+      int vid, List<Map<String, dynamic>> segs, String source,
+      {bool aiFurigana = true}) async {
     // 3) Furigana + DỊCH tiếng Việt lô đầu (để mở xem ngay) + lưu.
     final jp = [for (final s in segs) s['text'] as String];
-    final withFuri = await ai.furigana(jp);
+    // `aiFurigana: false` → bỏ hẳn lượt gọi model chính (Opus, đắt): máy ở nhà
+    // gắn furigana bằng SudachiPy miễn phí rồi đẩy lên qua route
+    // `/admin/videos/<id>/furigana` (scripts/furigana_offline.py).
+    final withFuri = aiFurigana ? await ai.furigana(jp) : jp;
     // Dịch NHANH phần ĐẦU (mở xem ngay); phần còn lại dịch TRỌN VIDEO ở nền
     // ngay trên máy chủ (không phụ thuộc app còn mở hay không).
     const kFirstChunk = 20;
@@ -2304,7 +2398,113 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       return bad('Caption json3 không có câu tiếng Nhật nào đọc được.',
           code: 422);
     }
-    return saveSubsFromSegs(vid, segs, 'caption-push');
+    // furigana: 'ai' (mặc định, gọi model chính) | 'local' (bỏ qua — máy gửi sẽ
+    // gắn offline rồi POST /admin/videos/<id>/furigana).
+    final wantAi = ((b['furigana'] as String?) ?? 'ai') != 'local';
+    final res = await saveSubsFromSegs(vid, segs, 'caption-push',
+        aiFurigana: wantAi);
+    if (wantAi || res.statusCode != 200) return res;
+    // Trả lại câu ĐÃ NGẮT (server ngắt theo nhịp đọc) để máy local gắn ruby vào
+    // đúng những câu này — không tự ngắt lại ở phía client.
+    return ok({
+      'count': db.sentences(vid).length,
+      'source': 'caption-push',
+      'furigana': 'pending-local',
+      'sentences': [
+        for (var i = 0; i < segs.length; i++)
+          {
+            'ord': i,
+            'jp': segs[i]['text'],
+            // Mốc từng từ của caption: gửi kèm để vòng 2 căn karaoke cho token
+            // MỚI (chưa có furigana thì cả câu là 1 token, không suy lại được).
+            'words': segs[i]['words'] ?? const [],
+          }
+      ],
+    });
+  });
+
+  // NHẬN FURIGANA LÀM SẴN Ở MÁY KHÁC: `scripts/furigana_offline.py` (SudachiPy)
+  // gắn `[漢字|かな]` miễn phí, ở đây chỉ tách token lại và GIỮ mốc karaoke
+  // (mốc từng từ được chuyển sang token mới theo vị trí ký tự).
+  r.post('/admin/videos/<id|[0-9]+>/furigana',
+      (Request req, String id) async {
+    final g = adminGuard(req);
+    if (g != null) return g;
+    final vid = int.parse(id);
+    if (db.video(vid) == null) return bad('Không tìm thấy video', code: 404);
+    final b = await readJson(req);
+    final lines = (b['lines'] as List?) ?? const [];
+    if (lines.isEmpty) return bad('Thiếu danh sách câu (field "lines").');
+    final byOrd = <int, String>{};
+    final wordsByOrd = <int, List<Map<String, dynamic>>>{};
+    for (final l in lines) {
+      final m = Map<String, dynamic>.from(l as Map);
+      final ord = (m['ord'] as num?)?.toInt();
+      final jp = (m['jp'] as String?) ?? '';
+      if (ord == null || jp.trim().isEmpty) continue;
+      byOrd[ord] = jp;
+      final w = (m['words'] as List?) ?? const [];
+      if (w.isNotEmpty) {
+        wordsByOrd[ord] = [
+          for (final e in w)
+            {
+              'text': '${(e as Map)['text'] ?? ''}',
+              'tMs': ((e)['tMs'] as num?)?.toInt() ?? 0,
+            }
+        ];
+      }
+    }
+    final rows = db.sentences(vid);
+    if (rows.isEmpty) return bad('Video chưa có phụ đề để gắn furigana', code: 422);
+    var changed = 0;
+    final sents = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      final ord = (row['ord'] as num).toInt();
+      final oldTokens = (jsonDecode(row['tokens_json'] as String? ?? '[]') as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      final ruby = byOrd[ord];
+      var tokens = oldTokens;
+      var words = (jsonDecode(row['words_json'] as String? ?? '[]') as List)
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      var plain = row['text_jp'] as String;
+      if (ruby != null) {
+        final parsed = _parseJp(ruby);
+        // Chỉ nhận khi bóc markup ra ĐÚNG câu gốc — chặn lệch câu/lệch thứ tự.
+        if (parsed.$3 == plain) {
+          tokens = parsed.$1;
+          words = parsed.$2;
+          // Karaoke: ưu tiên mốc TỪNG TỪ gốc của caption (client gửi lại từ
+          // vòng 1). Không có thì suy từ token cũ — chỉ giữ được mốc theo câu.
+          final timed = wordsByOrd[ord] ??
+              () {
+                final out = <Map<String, dynamic>>[];
+                var last = (row['start_ms'] as num).toInt();
+                for (final t in oldTokens) {
+                  final ms = (t['tMs'] as num?)?.toInt();
+                  if (ms != null) last = ms;
+                  out.add(
+                      {'text': (t['surface'] as String?) ?? '', 'tMs': last});
+                }
+                return out;
+              }();
+          if (timed.isNotEmpty) alignTokenTimings(tokens, plain, timed);
+          changed++;
+        }
+      }
+      sents.add({
+        'startMs': (row['start_ms'] as num).toInt(),
+        'endMs': (row['end_ms'] as num).toInt(),
+        'textJp': plain,
+        'tokens': tokens,
+        'words': words,
+        'vi': (jsonDecode(row['translations_json'] as String? ?? '{}')
+            as Map)['vi'] ?? '',
+      });
+    }
+    db.replaceVideoSentences(vid, sents);
+    return ok({'updated': changed, 'total': rows.length});
   });
 
   // Admin tạo phụ đề cho bất kỳ video nào.
