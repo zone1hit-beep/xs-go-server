@@ -28,6 +28,7 @@ AppleVerifiedTransaction tx({
   String originalTransactionId = 'orig-1',
   String accountToken = '00000000-0000-4000-8000-000000000001',
   String status = 'active',
+  int signedDate = 100,
   int expiresAt = 9999999999999,
   bool serverApiReconciled = true,
 }) =>
@@ -40,6 +41,7 @@ AppleVerifiedTransaction tx({
       appAccountToken: accountToken,
       kind: productId.contains('.video.') ? 'subscription' : 'non_consumable',
       status: status,
+      signedDate: signedDate,
       purchasedAt: 100,
       expiresAt: expiresAt,
       revokedAt: status == 'revoked' ? 200 : 0,
@@ -202,6 +204,7 @@ void main() {
         notificationType: 'REFUND',
         bundleId: 'com.xsgo.xsGo',
         environment: 'Sandbox',
+        signedDate: 200,
         outerJwsVerified: true,
         transactionJwsVerified: true,
         renewalInfoJwsVerified: false,
@@ -223,6 +226,7 @@ void main() {
         notificationType: 'DID_RENEW',
         bundleId: 'com.xsgo.xsGo',
         environment: 'Sandbox',
+        signedDate: 200,
         outerJwsVerified: true,
         transactionJwsVerified: true,
         renewalInfoJwsVerified: false,
@@ -249,6 +253,7 @@ void main() {
         notificationType: 'EXPIRED',
         bundleId: 'com.xsgo.xsGo',
         environment: 'Sandbox',
+        signedDate: 200,
         outerJwsVerified: true,
         transactionJwsVerified: true,
         renewalInfoJwsVerified: true,
@@ -264,6 +269,98 @@ void main() {
       expect(ledger!['user_id'], isNull);
       expect(ledger['status'], 'expired');
       expect(db.userEntitlements(uid), isEmpty);
+    });
+
+    test('revoked mới hơn không bị active notification cũ ghi đè', () async {
+      final original = tx(accountToken: accountToken, signedDate: 50);
+      await AppleBillingService(db, FakeAppleVerifier(transaction: original))
+          .verifyPurchase(uid, 'purchase');
+
+      final verifier = FakeAppleVerifier();
+      final service = AppleBillingService(db, verifier);
+      verifier.notification = AppleVerifiedNotification(
+        notificationId: 'revoke-newer',
+        notificationType: 'REVOKE',
+        bundleId: 'com.xsgo.xsGo',
+        environment: 'Sandbox',
+        signedDate: 300,
+        outerJwsVerified: true,
+        transactionJwsVerified: true,
+        renewalInfoJwsVerified: true,
+        transaction: original.copyWith(
+          status: 'revoked',
+          signedDate: 300,
+          revokedAt: 300,
+        ),
+      );
+      await service.processNotification('newer-revoke');
+
+      verifier.notification = AppleVerifiedNotification(
+        notificationId: 'renew-older',
+        notificationType: 'DID_RENEW',
+        bundleId: 'com.xsgo.xsGo',
+        environment: 'Sandbox',
+        signedDate: 200,
+        outerJwsVerified: true,
+        transactionJwsVerified: true,
+        renewalInfoJwsVerified: true,
+        transaction: original.copyWith(status: 'active', signedDate: 200),
+      );
+      await service.processNotification('older-active');
+
+      verifier.notification = AppleVerifiedNotification(
+        notificationId: 'renew-equal-time',
+        notificationType: 'DID_RENEW',
+        bundleId: 'com.xsgo.xsGo',
+        environment: 'Sandbox',
+        signedDate: 300,
+        outerJwsVerified: true,
+        transactionJwsVerified: true,
+        renewalInfoJwsVerified: true,
+        transaction: original.copyWith(status: 'active', signedDate: 300),
+      );
+      await service.processNotification('equal-time-active');
+
+      final ledger = db.storeTransaction(
+          store: 'apple', environment: 'Sandbox', transactionId: 'tx-1');
+      expect(ledger!['status'], 'revoked');
+      expect(ledger['state_changed_at'], 300);
+      expect(db.userEntitlements(uid), isNot(contains('video_monthly')));
+    });
+
+    test('active cũ được revoked notification mới hơn thu hồi', () async {
+      final original = tx(accountToken: accountToken, signedDate: 100);
+      await AppleBillingService(db, FakeAppleVerifier(transaction: original))
+          .verifyPurchase(uid, 'purchase');
+
+      final revoked = original.copyWith(
+        status: 'revoked',
+        signedDate: 400,
+        revokedAt: 400,
+      );
+      final service = AppleBillingService(
+        db,
+        FakeAppleVerifier(
+          notification: AppleVerifiedNotification(
+            notificationId: 'revoke-later',
+            notificationType: 'REVOKE',
+            bundleId: 'com.xsgo.xsGo',
+            environment: 'Sandbox',
+            signedDate: 400,
+            outerJwsVerified: true,
+            transactionJwsVerified: true,
+            renewalInfoJwsVerified: true,
+            transaction: revoked,
+          ),
+        ),
+      );
+      await service.processNotification('later-revoke');
+
+      final ledger = db.storeTransaction(
+          store: 'apple', environment: 'Sandbox', transactionId: 'tx-1');
+      expect(ledger!['status'], 'revoked');
+      expect(ledger['state_changed_at'], 400);
+      expect(db.userEntitlements(uid), isNot(contains('video_monthly')));
     });
   });
 }

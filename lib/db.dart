@@ -257,11 +257,14 @@ class Db {
         purchased_at INTEGER NOT NULL DEFAULT 0,
         expires_at INTEGER NOT NULL DEFAULT 0,
         revoked_at INTEGER NOT NULL DEFAULT 0,
+        state_changed_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (store, environment, transaction_id)
       );
     ''');
+    _safeAddColumn('store_transactions', 'state_changed_at',
+        'INTEGER NOT NULL DEFAULT 0');
     _db.execute('CREATE INDEX IF NOT EXISTS idx_store_tx_original '
         'ON store_transactions(store, environment, original_transaction_id)');
     _db.execute('CREATE INDEX IF NOT EXISTS idx_store_tx_account '
@@ -271,14 +274,20 @@ class Db {
         store TEXT NOT NULL,
         environment TEXT NOT NULL,
         transaction_id TEXT NOT NULL,
+        original_transaction_id TEXT NOT NULL DEFAULT '',
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         entitlement_key TEXT NOT NULL,
         status TEXT NOT NULL,
         expires_at INTEGER NOT NULL DEFAULT 0,
+        state_changed_at INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (store, environment, transaction_id, entitlement_key)
       );
     ''');
+    _safeAddColumn('store_entitlement_grants', 'original_transaction_id',
+        "TEXT NOT NULL DEFAULT ''");
+    _safeAddColumn('store_entitlement_grants', 'state_changed_at',
+        'INTEGER NOT NULL DEFAULT 0');
     _db.execute('CREATE INDEX IF NOT EXISTS idx_store_grants_user '
         'ON store_entitlement_grants(user_id, entitlement_key)');
     _db.execute('''
@@ -289,6 +298,7 @@ class Db {
         event_type TEXT NOT NULL,
         payload_hash TEXT NOT NULL,
         signed_payload TEXT NOT NULL,
+        signed_at INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'processing',
         attempts INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL,
@@ -296,6 +306,8 @@ class Db {
         PRIMARY KEY (store, environment, event_id)
       );
     ''');
+    _safeAddColumn(
+        'store_event_inbox', 'signed_at', 'INTEGER NOT NULL DEFAULT 0');
     // Quota XEM video của Free (3h/tháng): period_key = 'V:yyyy-mm'.
     _db.execute('''
       CREATE TABLE IF NOT EXISTS video_usage (
@@ -728,12 +740,34 @@ class Db {
   }) {
     final rows = _db.select(
         'SELECT * FROM store_transactions WHERE store = ? AND environment = ? '
-        'AND original_transaction_id = ? ORDER BY updated_at DESC LIMIT 1',
+        'AND original_transaction_id = ? ORDER BY state_changed_at DESC, '
+        "CASE status WHEN 'revoked' THEN 60 WHEN 'refunded' THEN 55 "
+        "WHEN 'expired' THEN 50 WHEN 'canceled' THEN 45 WHEN 'grace' THEN 20 "
+        "WHEN 'active' THEN 10 ELSE 0 END DESC, transaction_id DESC LIMIT 1",
         [store, environment, originalTransactionId]);
     return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
   }
 
-  void upsertStoreTransaction({
+  static int _storeStateRank(String status) => switch (status) {
+        'revoked' => 60,
+        'refunded' => 55,
+        'expired' => 50,
+        'canceled' => 45,
+        'grace' => 20,
+        'active' => 10,
+        _ => 0,
+      };
+
+  static bool _newerStoreState(
+      Map<String, dynamic>? current, int timestamp, String status) {
+    if (current == null) return true;
+    final currentTimestamp = current['state_changed_at'] as int? ?? 0;
+    if (timestamp != currentTimestamp) return timestamp > currentTimestamp;
+    return _storeStateRank(status) >
+        _storeStateRank(current['status'] as String? ?? '');
+  }
+
+  bool upsertStoreTransaction({
     required String store,
     required String environment,
     required String transactionId,
@@ -747,6 +781,7 @@ class Db {
     required int purchasedAt,
     int expiresAt = 0,
     int revokedAt = 0,
+    required int stateChangedAt,
   }) {
     final existing = storeTransaction(
         store: store,
@@ -759,16 +794,34 @@ class Db {
             existing['original_transaction_id'] != originalTransactionId)) {
       throw StateError('Transaction ownership/product mismatch');
     }
+    final current = storeTransactionByOriginal(
+        store: store,
+        environment: environment,
+        originalTransactionId: originalTransactionId);
+    if (current != null &&
+        (current['user_id'] != userId ||
+            current['account_token'] != accountToken ||
+            current['product_id'] != productId)) {
+      throw StateError('Transaction chain ownership/product mismatch');
+    }
+    if (!_newerStoreState(current, stateChangedAt, status)) return false;
     final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'UPDATE store_transactions SET status=?, expires_at=?, revoked_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND original_transaction_id=?',
+        [status, expiresAt, revokedAt, stateChangedAt, now, store, environment,
+          originalTransactionId]);
     _db.execute(
         'INSERT INTO store_transactions '
         '(store,environment,transaction_id,original_transaction_id,user_id,'
         'account_token,product_id,entitlement_key,kind,status,purchased_at,'
-        'expires_at,revoked_at,created_at,updated_at) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
+        'expires_at,revoked_at,state_changed_at,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
         'ON CONFLICT(store,environment,transaction_id) DO UPDATE SET '
         'status=excluded.status, expires_at=excluded.expires_at, '
-        'revoked_at=excluded.revoked_at, updated_at=excluded.updated_at',
+        'revoked_at=excluded.revoked_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
         [
           store,
           environment,
@@ -783,12 +836,14 @@ class Db {
           purchasedAt,
           expiresAt,
           revokedAt,
+          stateChangedAt,
           now,
           now
         ]);
+    return true;
   }
 
-  void upsertDetachedStoreTransaction({
+  bool upsertDetachedStoreTransaction({
     required String store,
     required String environment,
     required String transactionId,
@@ -801,6 +856,7 @@ class Db {
     required int purchasedAt,
     int expiresAt = 0,
     int revokedAt = 0,
+    required int stateChangedAt,
   }) {
     final original = storeTransactionByOriginal(
         store: store,
@@ -812,16 +868,24 @@ class Db {
         original['product_id'] != productId) {
       throw StateError('Detached transaction identity mismatch');
     }
+    if (!_newerStoreState(original, stateChangedAt, status)) return false;
     final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'UPDATE store_transactions SET status=?, expires_at=?, revoked_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND original_transaction_id=?',
+        [status, expiresAt, revokedAt, stateChangedAt, now, store, environment,
+          originalTransactionId]);
     _db.execute(
         'INSERT INTO store_transactions '
         '(store,environment,transaction_id,original_transaction_id,user_id,'
         'account_token,product_id,entitlement_key,kind,status,purchased_at,'
-        'expires_at,revoked_at,created_at,updated_at) '
-        'VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?) '
+        'expires_at,revoked_at,state_changed_at,created_at,updated_at) '
+        'VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?) '
         'ON CONFLICT(store,environment,transaction_id) DO UPDATE SET '
         'status=excluded.status, expires_at=excluded.expires_at, '
-        'revoked_at=excluded.revoked_at, updated_at=excluded.updated_at',
+        'revoked_at=excluded.revoked_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
         [
           store,
           environment,
@@ -835,30 +899,53 @@ class Db {
           purchasedAt,
           expiresAt,
           revokedAt,
+          stateChangedAt,
           now,
           now
         ]);
+    return true;
   }
 
-  void upsertStoreEntitlementGrant({
+  bool upsertStoreEntitlementGrant({
     required String store,
     required String environment,
     required String transactionId,
+    required String originalTransactionId,
     required int userId,
     required String entitlementKey,
     required String status,
     int expiresAt = 0,
+    required int stateChangedAt,
   }) {
+    final rows = _db.select(
+        'SELECT status,state_changed_at FROM store_entitlement_grants '
+        'WHERE store=? AND environment=? AND user_id=? '
+        'AND original_transaction_id=? AND entitlement_key=? '
+        'ORDER BY state_changed_at DESC LIMIT 1',
+        [store, environment, userId, originalTransactionId, entitlementKey]);
+    final current = rows.isEmpty
+        ? null
+        : Map<String, dynamic>.from(rows.first);
+    if (!_newerStoreState(current, stateChangedAt, status)) return false;
     final now = DateTime.now().millisecondsSinceEpoch;
     _db.execute(
+        'UPDATE store_entitlement_grants SET status=?, expires_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND user_id=? AND original_transaction_id=? AND entitlement_key=?',
+        [status, expiresAt, stateChangedAt, now, store, environment, userId,
+          originalTransactionId, entitlementKey]);
+    _db.execute(
         'INSERT INTO store_entitlement_grants '
-        '(store,environment,transaction_id,user_id,entitlement_key,status,'
-        'expires_at,updated_at) VALUES (?,?,?,?,?,?,?,?) '
+        '(store,environment,transaction_id,original_transaction_id,user_id,'
+        'entitlement_key,status,expires_at,state_changed_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?) '
         'ON CONFLICT(store,environment,transaction_id,entitlement_key) '
-        'DO UPDATE SET status=excluded.status, expires_at=excluded.expires_at, '
-        'updated_at=excluded.updated_at',
-        [store, environment, transactionId, userId, entitlementKey, status,
-          expiresAt, now]);
+        'DO UPDATE SET original_transaction_id=excluded.original_transaction_id, '
+        'status=excluded.status, expires_at=excluded.expires_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
+        [store, environment, transactionId, originalTransactionId, userId,
+          entitlementKey, status, expiresAt, stateChangedAt, now]);
+    return true;
   }
 
   bool beginStoreEvent({
@@ -868,6 +955,7 @@ class Db {
     required String eventType,
     required String payloadHash,
     required String signedPayload,
+    required int signedAt,
   }) {
     final rows = _db.select(
         'SELECT status, payload_hash FROM store_event_inbox '
@@ -889,9 +977,10 @@ class Db {
     _db.execute(
         'INSERT INTO store_event_inbox '
         '(store,environment,event_id,event_type,payload_hash,signed_payload,'
-        'status,attempts,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,?,?)',
+        'signed_at,status,attempts,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?, ?,1,?,?)',
         [store, environment, eventId, eventType, payloadHash, signedPayload,
-          'processing', now, now]);
+          signedAt, 'processing', now, now]);
     return true;
   }
 

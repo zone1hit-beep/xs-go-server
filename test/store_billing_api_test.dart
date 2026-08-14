@@ -10,9 +10,11 @@ import 'package:xs_go_server/db.dart';
 import 'package:xs_go_server/security.dart';
 
 class RouteAppleVerifier implements AppleVerifier {
-  RouteAppleVerifier({this.transaction, this.notification});
+  RouteAppleVerifier(
+      {this.transaction, this.notification, this.notificationError});
   AppleVerifiedTransaction? transaction;
   AppleVerifiedNotification? notification;
+  Object? notificationError;
 
   @override
   bool get configured => true;
@@ -24,8 +26,10 @@ class RouteAppleVerifier implements AppleVerifier {
 
   @override
   Future<AppleVerifiedNotification> verifyNotification(
-          String signedPayload) async =>
-      notification!;
+      String signedPayload) async {
+    if (notificationError case final error?) throw error;
+    return notification!;
+  }
 }
 
 AppleVerifiedTransaction verifiedTx(String accountToken,
@@ -39,6 +43,7 @@ AppleVerifiedTransaction verifiedTx(String accountToken,
       appAccountToken: accountToken,
       kind: 'subscription',
       status: status,
+      signedDate: 100,
       purchasedAt: 100,
       expiresAt: 9999999999999,
       revokedAt: 0,
@@ -58,15 +63,17 @@ void main() {
   });
 
   Future<Response> request(Handler api, String method, String path,
-          {String? token, Object? body}) =>
+          {String? token, Object? body, String? rawBody, String? ip}) =>
       Future.sync(() => api(Request(
             method,
             Uri.parse('http://localhost$path'),
             headers: {
               if (token != null) 'authorization': 'Bearer $token',
               if (body != null) 'content-type': 'application/json',
+              if (rawBody != null) 'content-type': 'application/json',
+              if (ip != null) 'fly-client-ip': ip,
             },
-            body: body == null ? null : jsonEncode(body),
+            body: rawBody ?? (body == null ? null : jsonEncode(body)),
           )));
 
   test('billing context yêu cầu auth và trả UUID ổn định', () async {
@@ -88,7 +95,8 @@ void main() {
     expect(db.userEntitlements(uid), isEmpty);
   });
 
-  test('Apple verify trusted adapter grant idempotent và không tin product client',
+  test(
+      'Apple verify trusted adapter grant idempotent và không tin product client',
       () async {
     final token = db.billingAccountToken(uid);
     final verifier = RouteAppleVerifier(transaction: verifiedTx(token));
@@ -119,6 +127,7 @@ void main() {
         notificationType: 'DID_RENEW',
         bundleId: 'com.xsgo.xsGo',
         environment: 'Sandbox',
+        signedDate: 100,
         outerJwsVerified: true,
         transactionJwsVerified: true,
         renewalInfoJwsVerified: true,
@@ -126,16 +135,68 @@ void main() {
       ),
     );
     final api = buildRouter(db, Ai(), Asr(), appleVerifier: verifier).call;
-    final first = await request(
-        api, 'POST', '/billing/apple/notifications/v2',
+    final first = await request(api, 'POST', '/billing/apple/notifications/v2',
         body: {'signedPayload': 'outer-signed'});
-    final second = await request(
-        api, 'POST', '/billing/apple/notifications/v2',
+    final second = await request(api, 'POST', '/billing/apple/notifications/v2',
         body: {'signedPayload': 'outer-signed'});
     expect(first.statusCode, 200);
     expect(second.statusCode, 200);
-    expect((jsonDecode(await first.readAsString()) as Map)['processed'], isTrue);
+    expect(
+        (jsonDecode(await first.readAsString()) as Map)['processed'], isTrue);
     expect(
         (jsonDecode(await second.readAsString()) as Map)['processed'], isFalse);
+  });
+
+  test('Notifications V2 ACK payload malformed/unverifiable vĩnh viễn',
+      () async {
+    final malformedApi = buildRouter(db, Ai(), Asr(),
+            appleVerifier: RouteAppleVerifier(
+                notificationError: const AppleEvidenceRejected('bad jws')))
+        .call;
+
+    final malformed = await request(
+        malformedApi, 'POST', '/billing/apple/notifications/v2',
+        rawBody: '{not-json', ip: '198.51.100.10');
+    expect(malformed.statusCode, 200);
+    expect((jsonDecode(await malformed.readAsString()) as Map)['discarded'],
+        isTrue);
+
+    final unverifiable = await request(
+        malformedApi, 'POST', '/billing/apple/notifications/v2',
+        body: {'signedPayload': 'permanent-bad-jws'}, ip: '198.51.100.10');
+    expect(unverifiable.statusCode, 200);
+    expect((jsonDecode(await unverifiable.readAsString()) as Map)['discarded'],
+        isTrue);
+  });
+
+  test('Notifications V2 body quá giới hạn được ACK và không vào verifier',
+      () async {
+    final verifier = RouteAppleVerifier(
+        notificationError: StateError('verifier must not be called'));
+    final api = buildRouter(db, Ai(), Asr(), appleVerifier: verifier).call;
+    final response = await request(
+        api, 'POST', '/billing/apple/notifications/v2',
+        rawBody: jsonEncode({'signedPayload': 'x' * (384 * 1024)}),
+        ip: '198.51.100.11');
+
+    expect(response.statusCode, 200);
+    expect((jsonDecode(await response.readAsString()) as Map)['reason'],
+        'body_too_large');
+  });
+
+  test('Notifications V2 verifier/runtime transient trả 503 để Apple retry',
+      () async {
+    for (final error in <Object>[
+      const AppleVerificationUnavailable(),
+      StateError('trust runtime temporarily unavailable'),
+    ]) {
+      final api = buildRouter(db, Ai(), Asr(),
+              appleVerifier: RouteAppleVerifier(notificationError: error))
+          .call;
+      final response = await request(
+          api, 'POST', '/billing/apple/notifications/v2',
+          body: {'signedPayload': 'valid-shape'}, ip: '198.51.100.12');
+      expect(response.statusCode, 503);
+    }
   });
 }

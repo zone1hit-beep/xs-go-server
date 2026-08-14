@@ -35,6 +35,7 @@ class AppleVerifiedTransaction {
     required this.appAccountToken,
     required this.kind,
     required this.status,
+    required this.signedDate,
     required this.purchasedAt,
     required this.expiresAt,
     required this.revokedAt,
@@ -50,6 +51,9 @@ class AppleVerifiedTransaction {
   final String appAccountToken;
   final String kind;
   final String status;
+
+  /// Milliseconds since epoch from the verified transaction JWS `signedDate`.
+  final int signedDate;
   final int purchasedAt;
   final int expiresAt;
   final int revokedAt;
@@ -68,6 +72,7 @@ class AppleVerifiedTransaction {
     String? appAccountToken,
     String? kind,
     String? status,
+    int? signedDate,
     int? purchasedAt,
     int? expiresAt,
     int? revokedAt,
@@ -84,6 +89,7 @@ class AppleVerifiedTransaction {
         appAccountToken: appAccountToken ?? this.appAccountToken,
         kind: kind ?? this.kind,
         status: status ?? this.status,
+        signedDate: signedDate ?? this.signedDate,
         purchasedAt: purchasedAt ?? this.purchasedAt,
         expiresAt: expiresAt ?? this.expiresAt,
         revokedAt: revokedAt ?? this.revokedAt,
@@ -99,6 +105,7 @@ class AppleVerifiedNotification {
     required this.notificationType,
     required this.bundleId,
     required this.environment,
+    required this.signedDate,
     required this.outerJwsVerified,
     required this.transactionJwsVerified,
     required this.renewalInfoJwsVerified,
@@ -109,6 +116,9 @@ class AppleVerifiedNotification {
   final String notificationType;
   final String bundleId;
   final String environment;
+
+  /// Milliseconds since epoch from the verified outer notification JWS.
+  final int signedDate;
   final bool outerJwsVerified;
   final bool transactionJwsVerified;
   final bool renewalInfoJwsVerified;
@@ -241,6 +251,9 @@ class AppleBillingService {
     if (notification.notificationId.isEmpty) {
       throw const AppleEvidenceRejected('Thiếu notificationUUID');
     }
+    if (notification.signedDate <= 0) {
+      throw const AppleEvidenceRejected('Notification signedDate không hợp lệ');
+    }
     final userId = _db.userIdByBillingAccountToken(tx.appAccountToken);
     final existing = _db.storeTransactionByOriginal(
       store: 'apple',
@@ -260,12 +273,13 @@ class AppleBillingService {
       eventType: notification.notificationType,
       payloadHash: digest,
       signedPayload: signedPayload,
+      signedAt: notification.signedDate,
     );
     if (!shouldProcess) return false;
     if (owner == null) {
-      _applyDetached(tx);
+      _applyDetached(tx, stateChangedAt: notification.signedDate);
     } else {
-      _apply(owner, tx);
+      _apply(owner, tx, stateChangedAt: notification.signedDate);
     }
     _db.completeStoreEvent(
       store: 'apple',
@@ -303,6 +317,9 @@ class AppleBillingService {
         !terminalStatuses.contains(tx.status)) {
       throw const AppleEvidenceRejected('Transaction status không hợp lệ');
     }
+    if (tx.signedDate <= 0) {
+      throw const AppleEvidenceRejected('Transaction signedDate không hợp lệ');
+    }
   }
 
   void _checkOwnership(int userId, AppleVerifiedTransaction tx) {
@@ -325,9 +342,10 @@ class AppleBillingService {
     }
   }
 
-  void _apply(int userId, AppleVerifiedTransaction tx) {
+  void _apply(int userId, AppleVerifiedTransaction tx, {int? stateChangedAt}) {
     final entitlement = AppleProductCatalog.entitlementOf(tx.productId)!;
-    _db.upsertStoreTransaction(
+    final orderTimestamp = stateChangedAt ?? tx.signedDate;
+    final accepted = _db.upsertStoreTransaction(
       store: 'apple',
       environment: tx.environment,
       transactionId: tx.transactionId,
@@ -341,19 +359,24 @@ class AppleBillingService {
       purchasedAt: tx.purchasedAt,
       expiresAt: tx.expiresAt,
       revokedAt: tx.revokedAt,
+      stateChangedAt: orderTimestamp,
     );
+    if (!accepted) return;
     _db.upsertStoreEntitlementGrant(
       store: 'apple',
       environment: tx.environment,
       transactionId: tx.transactionId,
+      originalTransactionId: tx.originalTransactionId,
       userId: userId,
       entitlementKey: entitlement,
       status: tx.status,
       expiresAt: tx.expiresAt,
+      stateChangedAt: orderTimestamp,
     );
   }
 
-  void _applyDetached(AppleVerifiedTransaction tx) {
+  void _applyDetached(AppleVerifiedTransaction tx,
+      {required int stateChangedAt}) {
     _db.upsertDetachedStoreTransaction(
       store: 'apple',
       environment: tx.environment,
@@ -367,6 +390,7 @@ class AppleBillingService {
       purchasedAt: tx.purchasedAt,
       expiresAt: tx.expiresAt,
       revokedAt: tx.revokedAt,
+      stateChangedAt: stateChangedAt,
     );
   }
 }

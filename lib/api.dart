@@ -203,6 +203,33 @@ String _clientIp(Request req) {
   return 'unknown';
 }
 
+class _RequestBodyTooLarge implements Exception {
+  const _RequestBodyTooLarge();
+}
+
+/// Reads a JSON object while enforcing the byte ceiling during streaming, so
+/// an attacker cannot force the whole request into memory first.
+Future<Map<String, dynamic>> _readJsonWithByteLimit(
+    Request req, int maxBytes) async {
+  final declared = int.tryParse(req.headers['content-length'] ?? '');
+  if (declared != null && declared > maxBytes) {
+    throw const _RequestBodyTooLarge();
+  }
+  final bytes = <int>[];
+  await for (final chunk in req.read()) {
+    if (bytes.length + chunk.length > maxBytes) {
+      throw const _RequestBodyTooLarge();
+    }
+    bytes.addAll(chunk);
+  }
+  if (bytes.isEmpty) return {};
+  final decoded = jsonDecode(utf8.decode(bytes));
+  if (decoded is! Map<String, dynamic>) {
+    throw const FormatException('JSON phải là object');
+  }
+  return decoded;
+}
+
 /// Xây router API cho XS GO.
 /// Tải audio của 1 video YouTube về file tạm bằng yt-dlp (+ ffmpeg). Trả file
 /// mp3, hoặc null nếu thiếu công cụ / YouTube chặn / lỗi. Chỉ chạy trên server
@@ -850,6 +877,7 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
     // nguyên vẹn cho Android versionCode 2. Không lưu thêm raw token vào ledger.
     final ledgerId = sha256.convert(utf8.encode(token)).toString();
     final accountToken = db.billingAccountToken(uid);
+    final ledgerChangedAt = DateTime.now().millisecondsSinceEpoch;
     db.upsertStoreTransaction(
       store: 'google_play',
       environment: gplayEnvironment,
@@ -864,15 +892,18 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
       purchasedAt: 0,
       expiresAt: v.expiryMs,
       revokedAt: v.state == 'revoked' ? DateTime.now().millisecondsSinceEpoch : 0,
+      stateChangedAt: ledgerChangedAt,
     );
     db.upsertStoreEntitlementGrant(
       store: 'google_play',
       environment: gplayEnvironment,
       transactionId: ledgerId,
+      originalTransactionId: ledgerId,
       userId: uid,
       entitlementKey: entKey,
       status: v.state,
       expiresAt: v.expiryMs,
+      stateChangedAt: ledgerChangedAt,
     );
     if (v.state == 'active') {
       // Mua đứt: trọn đời (expires 0). Subscription: hết hạn theo Google —
@@ -1794,23 +1825,60 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
   });
 
   r.post('/billing/apple/notifications/v2', (Request req) async {
-    if (!appleBilling.configured) {
-      return bad('Apple notifications verification chưa cấu hình', code: 503);
+    // Apple không gửi custom auth cho Notifications V2. Verified JWS là trust
+    // boundary; rate limit này chỉ chống abuse và đủ rộng cho retry/burst thật.
+    if (_limited('apple-notify:${_clientIp(req)}', 600, 60 * 1000)) {
+      return bad('Quá nhiều notification, thử lại sau', code: 429);
     }
     try {
-      final b = await readJson(req);
+      final b = await _readJsonWithByteLimit(req, 384 * 1024);
       final signed = ((b['signedPayload'] as String?) ?? '').trim();
       if (signed.isEmpty || signed.length > 262144) {
-        return bad('Thiếu hoặc sai signedPayload');
+        // Permanent shape failure: acknowledge so Apple does not retry forever.
+        return ok({
+          'ok': true,
+          'processed': false,
+          'discarded': true,
+          'reason': 'invalid_payload_shape'
+        });
+      }
+      if (!appleBilling.configured) {
+        return bad('Apple notifications verification chưa cấu hình', code: 503);
       }
       final processed = await appleBilling.processNotification(signed);
       return ok({'ok': true, 'processed': processed});
+    } on _RequestBodyTooLarge {
+      return ok({
+        'ok': true,
+        'processed': false,
+        'discarded': true,
+        'reason': 'body_too_large'
+      });
+    } on FormatException {
+      return ok({
+        'ok': true,
+        'processed': false,
+        'discarded': true,
+        'reason': 'malformed_json'
+      });
     } on AppleVerificationUnavailable {
       return bad('Apple notifications verification chưa cấu hình', code: 503);
     } on AppleEvidenceRejected catch (e) {
-      return bad(e.message, code: 400);
+      stderr.writeln(
+          '[apple-billing] discarded unverifiable notification: ${e.message}');
+      return ok({
+        'ok': true,
+        'processed': false,
+        'discarded': true,
+        'reason': 'unverifiable'
+      });
     } on AppleOwnershipConflict {
-      return bad('Notification ownership conflict', code: 409);
+      return ok({
+        'ok': true,
+        'processed': false,
+        'discarded': true,
+        'reason': 'ownership_conflict'
+      });
     } catch (e) {
       // Trả non-2xx để Apple retry; event inbox giữ payload đã verify cho lần
       // xử lý kế tiếp. Không log raw JWS hoặc transaction identifiers.
@@ -1893,6 +1961,7 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
         eventType: 'RTDN',
         payloadHash: payloadHash,
         signedPayload: data ?? '',
+        signedAt: DateTime.now().millisecondsSinceEpoch,
       );
       if (!shouldProcess) return ok({'ok': true, 'processed': false});
       if (data != null) {
@@ -1921,6 +1990,7 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
                 expiryMs: 0);
             if (entKey != null) db.revokeEntitlement(uid, entKey);
             final ledgerId = sha256.convert(utf8.encode(token)).toString();
+            final ledgerChangedAt = DateTime.now().millisecondsSinceEpoch;
             db.upsertStoreTransaction(
               store: 'google_play',
               environment: gplayEnvironment,
@@ -1934,15 +2004,18 @@ Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
               status: 'revoked',
               purchasedAt: 0,
               revokedAt: DateTime.now().millisecondsSinceEpoch,
+              stateChangedAt: ledgerChangedAt,
             );
             if (entKey != null) {
               db.upsertStoreEntitlementGrant(
                 store: 'google_play',
                 environment: gplayEnvironment,
                 transactionId: ledgerId,
+                originalTransactionId: ledgerId,
                 userId: uid,
                 entitlementKey: entKey,
                 status: 'revoked',
+                stateChangedAt: ledgerChangedAt,
               );
             }
           } else if (gplay.enabled) {

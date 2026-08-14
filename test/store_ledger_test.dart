@@ -40,6 +40,7 @@ void main() {
       kind: 'non_consumable',
       status: 'active',
       purchasedAt: 100,
+      stateChangedAt: 100,
     );
     db.upsertStoreTransaction(
       store: 'apple',
@@ -53,6 +54,7 @@ void main() {
       kind: 'non_consumable',
       status: 'active',
       purchasedAt: 100,
+      stateChangedAt: 100,
     );
 
     expect(db.storeTransactionsForUser(accountA), hasLength(1));
@@ -69,6 +71,7 @@ void main() {
         kind: 'non_consumable',
         status: 'active',
         purchasedAt: 100,
+        stateChangedAt: 100,
       ),
       throwsStateError,
     );
@@ -81,10 +84,12 @@ void main() {
       store: 'apple',
       environment: 'Sandbox',
       transactionId: 'tx-sub',
+      originalTransactionId: 'tx-sub',
       userId: accountA,
       entitlementKey: 'video_monthly',
       status: 'revoked',
       expiresAt: now - 1,
+      stateChangedAt: 100,
     );
 
     expect(db.userEntitlements(accountA), contains('video_monthly'));
@@ -96,19 +101,23 @@ void main() {
       store: 'google_play',
       environment: 'Production',
       transactionId: 'g-1',
+      originalTransactionId: 'g-1',
       userId: accountA,
       entitlementKey: 'video_yearly',
       status: 'active',
       expiresAt: future,
+      stateChangedAt: 100,
     );
     db.upsertStoreEntitlementGrant(
       store: 'apple',
       environment: 'Sandbox',
       transactionId: 'a-1',
+      originalTransactionId: 'a-1',
       userId: accountA,
       entitlementKey: 'video_yearly',
       status: 'revoked',
       expiresAt: future,
+      stateChangedAt: 100,
     );
 
     expect(db.userEntitlements(accountA), contains('video_yearly'));
@@ -129,15 +138,18 @@ void main() {
       status: 'active',
       purchasedAt: 100,
       expiresAt: 9999999999999,
+      stateChangedAt: 100,
     );
     db.upsertStoreEntitlementGrant(
       store: 'apple',
       environment: 'Production',
       transactionId: 'tx-delete',
+      originalTransactionId: 'orig-delete',
       userId: accountA,
       entitlementKey: 'video_monthly',
       status: 'active',
       expiresAt: 9999999999999,
+      stateChangedAt: 100,
     );
     expect(db.hasActiveStoreSubscription(accountA), isTrue);
 
@@ -160,6 +172,7 @@ void main() {
         eventType: 'DID_RENEW',
         payloadHash: 'hash',
         signedPayload: 'signed',
+        signedAt: 100,
       ),
       isTrue,
     );
@@ -173,6 +186,7 @@ void main() {
         eventType: 'DID_RENEW',
         payloadHash: 'hash',
         signedPayload: 'signed',
+        signedAt: 100,
       ),
       isFalse,
     );
