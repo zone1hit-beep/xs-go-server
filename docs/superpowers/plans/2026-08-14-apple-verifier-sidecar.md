@@ -105,4 +105,3 @@
 - [ ] Run full `npm test`, `npm audit`, `dart analyze`, `dart test`, Docker topology checks, secret scans, and Git diff checks.
 - [ ] Update the audit report with test counts, smoke limitations, Fly secrets, owner actions, readiness, and Android backward compatibility.
 - [ ] Commit, push `codex/apple-verifier-sidecar`, create a PR into `main`, and stop without merging or deploying.
-

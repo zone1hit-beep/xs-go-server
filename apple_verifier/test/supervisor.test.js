@@ -92,18 +92,38 @@ test('enabled mode starts both and a child death terminates its sibling', () => 
   }
 });
 
+test('a clean child exit is still a watchdog failure when Apple is enabled', () => {
+  const children = [];
+  const result = supervise({
+    env: completeEnv,
+    spawnProcess(command) {
+      const child = new FakeChild(command);
+      children.push(child);
+      return child;
+    },
+    logger: () => {},
+    setExitCode: () => {},
+  });
+
+  children[1].emit('exit', 0, null);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(children[0].kills, ['SIGTERM']);
+});
+
 test('a Fly secret can materialize only a private mode-0600 runtime key', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'xsgo-apple-'));
   const target = path.join(directory, 'iap.p8');
   const privateKey = 'runtime-secret-fixture';
-  await materializeRuntimeKey({
+  const env = {
     ...completeEnv,
     APPLE_IAP_KEY_PATH: target,
     APPLE_IAP_PRIVATE_KEY_BASE64: Buffer.from(privateKey).toString('base64'),
-  });
+  };
+  await materializeRuntimeKey(env);
 
   assert.equal(await readFile(target, 'utf8'), privateKey);
   assert.equal((await stat(target)).mode & 0o777, 0o600);
+  assert.equal(Object.hasOwn(env, 'APPLE_IAP_PRIVATE_KEY_BASE64'), false);
 });
 
 test('key material alone cannot turn incomplete Apple config into a watchdog', async () => {

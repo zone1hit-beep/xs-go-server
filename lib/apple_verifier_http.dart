@@ -21,8 +21,8 @@ AppleVerifier appleVerifierFromEnvironment(
   Duration timeout = const Duration(seconds: 12),
   Uri? baseUri,
 }) {
-  final complete = _requiredConfig.every(
-      (key) => (environment[key] ?? '').trim().isNotEmpty);
+  final complete = _requiredConfig
+      .every((key) => (environment[key] ?? '').trim().isNotEmpty);
   final target = (environment['APPLE_ENVIRONMENT'] ?? '').trim();
   final token = (environment['XSGO_APPLE_VERIFIER_TOKEN'] ?? '').trim();
   if (!complete ||
@@ -95,10 +95,8 @@ class HttpAppleVerifier implements AppleVerifier {
         environment: _string(json, 'environment'),
         signedDate: _integer(json, 'signedDate'),
         outerJwsVerified: _boolean(json, 'outerJwsVerified'),
-        transactionJwsVerified:
-            _boolean(json, 'transactionJwsVerified'),
-        renewalInfoJwsVerified:
-            _boolean(json, 'renewalInfoJwsVerified'),
+        transactionJwsVerified: _boolean(json, 'transactionJwsVerified'),
+        renewalInfoJwsVerified: _boolean(json, 'renewalInfoJwsVerified'),
         transaction: _transactionFromJson(transactionJson),
       );
     } on FormatException {
@@ -159,8 +157,7 @@ class HttpAppleVerifier implements AppleVerifier {
         purchasedAt: _integer(json, 'purchasedAt'),
         expiresAt: _integer(json, 'expiresAt', positive: false),
         revokedAt: _integer(json, 'revokedAt', positive: false),
-        transactionJwsVerified:
-            _boolean(json, 'transactionJwsVerified'),
+        transactionJwsVerified: _boolean(json, 'transactionJwsVerified'),
         serverApiReconciled: _boolean(json, 'serverApiReconciled'),
       );
     } on FormatException {

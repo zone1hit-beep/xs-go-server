@@ -45,7 +45,10 @@ Map<String, dynamic> evidence({
 void main() {
   test('missing or partial config leaves the existing fail-closed verifier',
       () async {
-    for (final env in [<String, String>{}, {'APPLE_IAP_KEY_ID': 'only-one'}]) {
+    for (final env in [
+      <String, String>{},
+      {'APPLE_IAP_KEY_ID': 'only-one'}
+    ]) {
       final verifier = appleVerifierFromEnvironment(env);
       expect(verifier.configured, isFalse);
       expect(verifier.verifyAndReconcileTransaction('jws'),
@@ -81,8 +84,8 @@ void main() {
       expect(request.headers['authorization'],
           'Bearer ${completeEnv['XSGO_APPLE_VERIFIER_TOKEN']}');
     }
-    expect(jsonDecode(requests.first.body),
-        {'signedTransaction': 'device-jws'});
+    expect(
+        jsonDecode(requests.first.body), {'signedTransaction': 'device-jws'});
     expect(jsonDecode(requests.last.body), {'transactionId': 'tx-1'});
   });
 
@@ -90,18 +93,19 @@ void main() {
     final verifier = appleVerifierFromEnvironment(
       completeEnv,
       client: MockClient((request) async => http.Response(
-        jsonEncode(request.url.path == '/verify/transaction'
-            ? evidence()
-            : evidence(transactionId: 'different', reconciled: true)),
-        200,
-      )),
+            jsonEncode(request.url.path == '/verify/transaction'
+                ? evidence()
+                : evidence(transactionId: 'different', reconciled: true)),
+            200,
+          )),
     );
 
     expect(verifier.verifyAndReconcileTransaction('device-jws'),
         throwsA(isA<AppleEvidenceRejected>()));
   });
 
-  test('valid mocked sidecar evidence reaches ledger, wrong account/product do not',
+  test(
+      'valid mocked sidecar evidence reaches ledger, wrong account/product do not',
       () async {
     final db = Db.open(':memory:');
     final uid = db.createUser('sidecar@xsgo.app', 'x', 'vi', 'N5');
@@ -111,11 +115,11 @@ void main() {
         appleVerifierFromEnvironment(
           completeEnv,
           client: MockClient((request) async => http.Response(
-            jsonEncode(request.url.path == '/verify/transaction'
-                ? first
-                : {...first, 'serverApiReconciled': true}),
-            200,
-          )),
+                jsonEncode(request.url.path == '/verify/transaction'
+                    ? first
+                    : {...first, 'serverApiReconciled': true}),
+                200,
+              )),
         );
 
     final valid = verifierFor(evidence(accountToken: accountToken));
@@ -155,7 +159,8 @@ void main() {
         throwsA(isA<AppleVerificationUnavailable>()));
   });
 
-  test('permanent evidence rejection stays distinct from malformed trusted response',
+  test(
+      'permanent evidence rejection stays distinct from malformed trusted response',
       () async {
     final rejected = appleVerifierFromEnvironment(
       completeEnv,

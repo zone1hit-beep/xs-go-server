@@ -28,6 +28,7 @@ export async function materializeRuntimeKey(env) {
   }
   await mkdir(path.dirname(target), {recursive: true, mode: 0o700});
   await writeFile(target, decoded, {mode: 0o600});
+  delete env.APPLE_IAP_PRIVATE_KEY_BASE64;
   return true;
 }
 
@@ -58,7 +59,10 @@ export function supervise({
   const stop = (name, code, signal) => {
     if (stopping) return;
     stopping = true;
-    const exitCode = Number.isInteger(code) ? code : signal ? 1 : 78;
+    const childCode = Number.isInteger(code) ? code : signal ? 1 : 78;
+    const exitCode = mode === 'apple-enabled' && childCode === 0
+      ? 1
+      : childCode;
     state.exitCode = exitCode;
     setExitCode(exitCode);
     logger(`${name} stopped; container supervisor exiting`);

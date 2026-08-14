@@ -106,6 +106,11 @@ Required to enable the sidecar:
 - `APPLE_ENVIRONMENT` (`SANDBOX` first; `PRODUCTION` is separately validated)
 - `XSGO_APPLE_VERIFIER_TOKEN`
 
+For Fly, `APPLE_IAP_PRIVATE_KEY_BASE64` may contain the runtime-only base64
+key. The supervisor writes it to the absolute `APPLE_IAP_KEY_PATH` with mode
+`0600` before starting Node. This value is not part of the enablement decision,
+is never returned by health, and is never logged.
+
 The implementation may accept private-key content from a Fly secret only to
 materialize an ephemeral mode-0600 runtime file before the sidecar starts. The
 key must never be copied into the image, repository, logs, docs, or tests.
@@ -125,6 +130,52 @@ key must never be copied into the image, repository, logs, docs, or tests.
 
 ## Verification report
 
-Implementation status, test counts, local smoke result, Docker topology check,
-and remaining Sandbox blockers are recorded here before the PR is opened.
+Implemented locally:
 
+- Official Node library `3.1.0` verifies transaction JWS, Notifications V2
+  outer/nested JWS, certificate trust, bundle and environment; trust anchors
+  are three reviewed Apple PKI DER roots pinned by SHA-256 tests.
+- Dart calls the loopback sidecar, reconciles purchases using Get Transaction
+  Info, compares verified transaction identity, and preserves the Phase 3B
+  product/account/idempotency checks.
+- Internal auth, credential-free health, bounded request bodies, timeout/socket
+  failure, partial config, runtime-key permissions and watchdog behavior have
+  automated tests.
+- The image declares Node 22, keeps Dart on `8091`, exposes only `8091`, and
+  starts Dart-only when Apple configuration is absent/incomplete.
+
+Read-only Sandbox smoke result on 2026-08-14:
+
+- `AUTH_CONNECTIVITY_PASS_TRANSACTION_NOT_FOUND`
+- `jwsVerification: NOT_TESTED`
+
+This is evidence only that the provided key/issuer/bundle combination could
+authenticate to the Sandbox App Store Server API over the network. It is not a
+purchase-verification result.
+
+Automated verification on 2026-08-14:
+
+- Node 22 native suite: 22/22 PASS.
+- Dart server suite: 83/83 PASS.
+- `dart analyze`: PASS, no issues.
+- `npm audit --omit=dev`: PASS, 0 vulnerabilities.
+- Live local sidecar `/health`: exactly `{"ok":true}`.
+- Changed-worktree private-key/credential scan: PASS; no `.p8` is tracked or
+  copied into the Docker build context.
+
+Still fail-closed / blocked before deployment:
+
+- No real Sandbox/TestFlight transaction JWS was supplied, so purchase,
+  restore, device reinstall/account switch and Get Transaction Info identity
+  reconciliation are not proven end to end against Apple.
+- No real Notifications V2 delivery has exercised outer plus nested JWS and
+  lifecycle ordering against Apple.
+- Production credentials/environment and Production JWS remain untested;
+  selling remains OFF.
+- Docker is not installed in the local execution environment, so the image
+  topology is statically defined and unit-tested but the final container build
+  must run in CI/review before any deploy approval.
+
+Runtime decision: keep the official Node 22 verifier in the **same container**,
+not a separately exposed service. A safe Dart-only replacement was not found;
+XS GO therefore does not hand-roll Apple X.509/JWS validation in Dart.
