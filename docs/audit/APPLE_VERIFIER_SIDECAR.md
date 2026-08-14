@@ -24,8 +24,10 @@ When the complete Apple verifier configuration is absent, the supervisor starts
 Dart alone. Existing Android clients and all non-Apple routes therefore retain
 their current behavior, while Apple verification remains the existing
 fail-closed 503 path. When the complete configuration is present, the
-supervisor starts both processes and terminates the container if either one
-dies, allowing Fly to restart the machine after a future deployment.
+supervisor starts both processes. If Node stops, Dart stays available for
+Android and non-Apple APIs while Apple verification returns fail-closed 503.
+Only Dart stopping terminates the sidecar and exits the container so Fly can
+restart the public service after a future deployment.
 
 The sidecar uses Apple's official
 `@apple/app-store-server-library@3.1.0`. `SignedDataVerifier` performs JWS,
@@ -156,7 +158,7 @@ purchase-verification result.
 Automated verification on 2026-08-14:
 
 - Node 22 native suite: 22/22 PASS.
-- Dart server suite: 83/83 PASS.
+- Dart server suite: 84/84 PASS.
 - `dart analyze`: PASS, no issues.
 - `npm audit --omit=dev`: PASS, 0 vulnerabilities.
 - Live local sidecar `/health`: exactly `{"ok":true}`.

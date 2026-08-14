@@ -46,34 +46,49 @@ export function supervise({
   const mode = runtimeMode(env ?? {});
   const state = {mode, exitCode: null};
   const children = [];
-  let stopping = false;
+  let dartStopping = false;
+  let appleStopped = false;
 
-  const start = (name, command, args = []) => {
+  const start = (role, name, command, args = []) => {
     const child = spawnProcess(command, args);
-    children.push({name, child});
-    child.once('error', () => stop(name, 78, null));
-    child.once('exit', (code, signal) => stop(name, code, signal));
+    const entry = {role, name, child, running: true};
+    children.push(entry);
+    const ended = (code, signal) => {
+      if (!entry.running) return;
+      entry.running = false;
+      childStopped(entry, code, signal);
+    };
+    child.once('error', () => ended(78, null));
+    child.once('exit', ended);
     return child;
   };
 
-  const stop = (name, code, signal) => {
-    if (stopping) return;
-    stopping = true;
+  const childStopped = (entry, code, signal) => {
+    if (entry.role === 'apple') {
+      if (dartStopping || appleStopped) return;
+      appleStopped = true;
+      logger(
+        'Apple verifier stopped; Dart remains available and Apple verification stays fail-closed',
+      );
+      return;
+    }
+    if (dartStopping) return;
+    dartStopping = true;
     const childCode = Number.isInteger(code) ? code : signal ? 1 : 78;
-    const exitCode = mode === 'apple-enabled' && childCode === 0
-      ? 1
-      : childCode;
+    const exitCode = childCode === 0 ? 1 : childCode;
     state.exitCode = exitCode;
     setExitCode(exitCode);
-    logger(`${name} stopped; container supervisor exiting`);
-    for (const entry of children) {
-      if (entry.name !== name) entry.child.kill('SIGTERM');
+    logger('Dart server stopped; container supervisor exiting');
+    for (const sibling of children) {
+      if (sibling.role === 'apple' && sibling.running) {
+        sibling.child.kill('SIGTERM');
+      }
     }
   };
 
-  start('Dart server', '/app/server');
+  start('dart', 'Dart server', '/app/server');
   if (mode === 'apple-enabled') {
-    start('Apple verifier', process.execPath, [
+    start('apple', 'Apple verifier', process.execPath, [
       '/app/apple_verifier/src/server.js',
     ]);
   } else {

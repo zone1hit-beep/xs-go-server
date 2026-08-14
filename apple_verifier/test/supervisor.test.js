@@ -59,12 +59,13 @@ test('Dart-only mode never starts or watches the Apple sidecar', async () => {
   assert.deepEqual(spawns, [['/app/server', []]]);
   assert.equal(result.mode, 'dart-only');
   children[0].emit('exit', 0, null);
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 1);
 });
 
-test('enabled mode starts both and a child death terminates its sibling', () => {
+test('Apple sidecar crash leaves Dart and the container running', () => {
   const children = [];
   const logs = [];
+  const exitCodes = [];
   const result = supervise({
     env: completeEnv,
     spawnProcess(command) {
@@ -73,14 +74,15 @@ test('enabled mode starts both and a child death terminates its sibling', () => 
       return child;
     },
     logger: (line) => logs.push(line),
-    setExitCode: () => {},
+    setExitCode: (code) => exitCodes.push(code),
   });
 
   assert.equal(result.mode, 'apple-enabled');
   assert.equal(children.length, 2);
   children[1].emit('exit', 70, null);
-  assert.deepEqual(children[0].kills, ['SIGTERM']);
-  assert.equal(result.exitCode, 70);
+  assert.deepEqual(children[0].kills, []);
+  assert.equal(result.exitCode, null);
+  assert.deepEqual(exitCodes, []);
   const output = logs.join('\n');
   for (const secret of [
     completeEnv.APPLE_IAP_KEY_ID,
@@ -92,7 +94,7 @@ test('enabled mode starts both and a child death terminates its sibling', () => 
   }
 });
 
-test('a clean child exit is still a watchdog failure when Apple is enabled', () => {
+test('Dart exit terminates the Apple sidecar and exits the container', () => {
   const children = [];
   const result = supervise({
     env: completeEnv,
@@ -105,9 +107,9 @@ test('a clean child exit is still a watchdog failure when Apple is enabled', () 
     setExitCode: () => {},
   });
 
-  children[1].emit('exit', 0, null);
+  children[0].emit('exit', 0, null);
   assert.equal(result.exitCode, 1);
-  assert.deepEqual(children[0].kills, ['SIGTERM']);
+  assert.deepEqual(children[1].kills, ['SIGTERM']);
 });
 
 test('a Fly secret can materialize only a private mode-0600 runtime key', async () => {

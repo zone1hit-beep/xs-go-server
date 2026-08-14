@@ -64,8 +64,11 @@ flutter build apk --dart-define=XSGO_API=https://xs-go-server.fly.dev
 
 Phase sidecar chỉ chuẩn bị code; **không chạy các lệnh dưới đây** cho đến khi có
 phê duyệt deploy riêng. Dart vẫn là public service ở `8091`; Node 22 chỉ nghe
-`127.0.0.1:9000`. Docker supervisor chỉ watch Node khi toàn bộ Apple config hợp
-lệ. Thiếu/partial config thì container chạy Dart-only để bảo toàn Android.
+`127.0.0.1:9000`. Docker supervisor chỉ khởi động Node khi toàn bộ Apple config
+hợp lệ, nhưng Node chết không được làm Dart/container dừng: Apple verify trả 503
+fail-closed còn Android/API vẫn phục vụ. Chỉ Dart chết mới terminate Node và
+thoát container để Fly restart. Thiếu/partial config thì container chạy
+Dart-only để bảo toàn Android.
 
 Trước deploy Sandbox, owner phải:
 
