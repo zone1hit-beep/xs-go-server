@@ -5,6 +5,7 @@ import 'package:test/test.dart';
 import 'package:xs_go_server/ai.dart';
 import 'package:xs_go_server/api.dart';
 import 'package:xs_go_server/apple_billing.dart';
+import 'package:xs_go_server/apple_verifier_http.dart';
 import 'package:xs_go_server/asr.dart';
 import 'package:xs_go_server/db.dart';
 import 'package:xs_go_server/security.dart';
@@ -92,6 +93,34 @@ void main() {
     final response = await request(api, 'POST', '/billing/apple/verify',
         token: jwt, body: {'signedTransaction': 'client-jws'});
     expect(response.statusCode, 503);
+    expect(db.userEntitlements(uid), isEmpty);
+  });
+
+  test('sidecar unavailable trả Apple 503 nhưng Dart health vẫn phục vụ',
+      () async {
+    final verifier = appleVerifierFromEnvironment(
+      const {
+        'APPLE_IAP_KEY_PATH': '/runtime/apple.p8',
+        'APPLE_IAP_KEY_ID': 'KEY1234567',
+        'APPLE_IAP_ISSUER_ID':
+            '11111111-2222-3333-4444-555555555555',
+        'APPLE_BUNDLE_ID': 'com.xsgo.xsGo',
+        'APPLE_APP_ID': '6800309856',
+        'APPLE_ENVIRONMENT': 'SANDBOX',
+        'XSGO_APPLE_VERIFIER_TOKEN':
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      },
+      baseUri: Uri.parse('http://127.0.0.1:1'),
+      timeout: const Duration(milliseconds: 100),
+    );
+    final api = buildRouter(db, Ai(), Asr(), appleVerifier: verifier).call;
+
+    final verify = await request(api, 'POST', '/billing/apple/verify',
+        token: jwt, body: {'signedTransaction': 'client-jws'});
+    final health = await request(api, 'GET', '/health');
+
+    expect(verify.statusCode, 503);
+    expect(health.statusCode, 200);
     expect(db.userEntitlements(uid), isEmpty);
   });
 

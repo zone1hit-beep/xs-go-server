@@ -1,8 +1,8 @@
 # XS GO Backend (Dart)
 
-Backend mới cho app XS GO — **thay thế backend Replit cũ**. Viết bằng Dart (cùng
-ngôn ngữ với app Flutter) nên chạy được ngay trên máy Mac chỉ cần Dart SDK, không
-cần Node/Docker/Postgres.
+Backend mới cho app XS GO — **thay thế backend Replit cũ**. API chính viết bằng
+Dart. Apple IAP có một verifier Node 22 tùy chọn trong cùng container vì XS GO
+dùng thư viện server chính thức của Apple thay vì tự viết X.509/JWS trust.
 
 ## Stack
 - **shelf + shelf_router** — HTTP server.
@@ -27,6 +27,27 @@ Mặc định lắng nghe `http://0.0.0.0:8091`.
 | `XSGO_JWT_SECRET` | Khóa ký JWT (đổi khi lên production) | dev secret |
 | `XSGO_DB` | Đường dẫn file SQLite | `xs_go.db` |
 | `PORT` | Cổng | `8091` |
+
+### Apple verifier tùy chọn
+
+Apple IAP mặc định fail-closed và không ảnh hưởng API Google Billing hiện hữu.
+Sidecar chỉ được supervisor khởi động khi toàn bộ cấu hình dưới đây hợp lệ; nếu
+thiếu hoặc chỉ cấu hình một phần, Dart vẫn chạy bình thường trên `8091` và Apple
+verify tiếp tục trả unavailable, không cấp entitlement.
+
+| Biến | Ý nghĩa |
+|---|---|
+| `APPLE_IAP_KEY_PATH` | File private `.p8` chỉ tồn tại ở runtime |
+| `APPLE_IAP_KEY_ID` | App Store Connect In-App Purchase Key ID |
+| `APPLE_IAP_ISSUER_ID` | App Store Connect Issuer ID |
+| `APPLE_BUNDLE_ID` | Bundle ID đã đăng ký |
+| `APPLE_APP_ID` | Numeric Apple app ID |
+| `APPLE_ENVIRONMENT` | `SANDBOX` hoặc `PRODUCTION` |
+| `XSGO_APPLE_VERIFIER_TOKEN` | Shared token ngẫu nhiên tối thiểu 32 ký tự, chỉ từ ENV |
+| `APPLE_IAP_PRIVATE_KEY_BASE64` | Tùy chọn cho Fly: key base64 được materialize mode `0600` vào `APPLE_IAP_KEY_PATH` |
+
+Node chỉ bind `127.0.0.1:9000`; Fly/public network không expose port này. `GET
+/health` của sidecar chỉ trả readiness, không trả credential metadata.
 
 > 💡 Dịch phụ đề là tác vụ khối lượng lớn. Nếu muốn rẻ hơn Opus, đặt
 > `XSGO_AI_MODEL=claude-haiku-4-5`. Bản dịch được **cache trong SQLite** nên mỗi

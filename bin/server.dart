@@ -6,6 +6,7 @@ import 'package:shelf/shelf_io.dart' as io;
 import 'package:xs_go_server/ai.dart';
 import 'package:xs_go_server/asr.dart';
 import 'package:xs_go_server/api.dart';
+import 'package:xs_go_server/apple_verifier_http.dart';
 import 'package:xs_go_server/db.dart';
 import 'package:xs_go_server/security.dart';
 
@@ -136,13 +137,15 @@ Future<void> main(List<String> args) async {
     model: env['XSGO_ASR_MODEL'] ?? 'whisper-large-v3-turbo',
   );
 
+  final appleVerifier = appleVerifierFromEnvironment(env);
+
   final handler = const Pipeline()
       .addMiddleware(_cors())
       .addMiddleware(_gzip()) // nén NGOÀI cùng (sau cache) — cache giữ bản thô
       .addMiddleware(_jsonErrors())
       .addMiddleware(logRequests())
       .addMiddleware(_publicCache())
-      .addHandler(buildRouter(db, ai, asr).call);
+      .addHandler(buildRouter(db, ai, asr, appleVerifier: appleVerifier).call);
 
   final port = int.parse(env['PORT'] ?? '8091');
   final server = await io.serve(handler, '0.0.0.0', port);

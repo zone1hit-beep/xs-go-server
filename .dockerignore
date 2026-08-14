@@ -1,5 +1,8 @@
 # Không copy dữ liệu/rác local vào build context & image.
 .dart_tool/
+.env
+*.p8
+*private*key*
 .git/
 .gitignore
 # DB local + WAL (KHÔNG bao giờ ship dữ liệu dev lên image — DB thật nằm ở volume /data)

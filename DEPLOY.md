@@ -59,3 +59,37 @@ flutter build apk --dart-define=XSGO_API=https://xs-go-server.fly.dev
   implemented above. Before production rollout, add counters/alerts for each
   discard reason and transient failure class so verifier outages are distinct
   from hostile malformed traffic without logging payload contents.
+
+## Apple verifier sidecar — deployment gate (chưa được thực hiện)
+
+Phase sidecar chỉ chuẩn bị code; **không chạy các lệnh dưới đây** cho đến khi có
+phê duyệt deploy riêng. Dart vẫn là public service ở `8091`; Node 22 chỉ nghe
+`127.0.0.1:9000`. Docker supervisor chỉ khởi động Node khi toàn bộ Apple config
+hợp lệ, nhưng Node chết không được làm Dart/container dừng: Apple verify trả 503
+fail-closed còn Android/API vẫn phục vụ. Chỉ Dart chết mới terminate Node và
+thoát container để Fly restart. Thiếu/partial config thì container chạy
+Dart-only để bảo toàn Android.
+
+Trước deploy Sandbox, owner phải:
+
+1. Lấy App Store Connect In-App Purchase key `.p8`, Key ID và Issuer ID; xác
+   nhận key có quyền gọi App Store Server API. File `.p8` không được commit,
+   copy vào image hoặc ghi log.
+2. Xác nhận Bundle ID, numeric Apple app ID, `SANDBOX`, và tạo shared token nội
+   bộ ngẫu nhiên tối thiểu 32 ký tự.
+3. Base64 key cục bộ, đặt nội dung đó vào Fly secret
+   `APPLE_IAP_PRIVATE_KEY_BASE64`, đồng thời đặt
+   `APPLE_IAP_KEY_PATH=/run/xsgo-secrets/apple-iap.p8`. Supervisor chỉ tạo file
+   runtime mode `0600`.
+4. Đặt các biến còn lại bằng `fly secrets set`: `APPLE_IAP_KEY_ID`,
+   `APPLE_IAP_ISSUER_ID`, `APPLE_BUNDLE_ID`, `APPLE_APP_ID`,
+   `APPLE_ENVIRONMENT`, `APPLE_IAP_KEY_PATH`,
+   `XSGO_APPLE_VERIFIER_TOKEN`. Không đưa giá trị vào shell history/shared docs.
+5. Cung cấp transaction Sandbox/TestFlight thật và cấu hình Notifications V2
+   Sandbox URL sau khi deployment được duyệt. Chạy purchase/restore,
+   notification lifecycle và reconciliation trước khi cân nhắc Production.
+
+Get Transaction Info với ID giả chỉ kiểm tra credential/network/API auth. Lỗi
+typed `TRANSACTION_ID_NOT_FOUND` là PASS cho lớp đó nhưng **không** chứng minh
+JWS purchase verification. Production/selling phải tiếp tục OFF cho đến khi có
+evidence end-to-end bằng transaction thật.
