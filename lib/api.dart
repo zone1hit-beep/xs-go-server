@@ -8,6 +8,7 @@ import 'package:shelf_router/shelf_router.dart';
 import 'ai.dart';
 import 'asr.dart';
 import 'billing.dart';
+import 'apple_billing.dart';
 import 'db.dart';
 import 'security.dart';
 import 'social_auth.dart';
@@ -658,8 +659,10 @@ bool blockAdminSocial({
   return !emailVerified || !adminAccountExists;
 }
 
-Router buildRouter(Db db, Ai ai, Asr asr) {
+Router buildRouter(Db db, Ai ai, Asr asr, {AppleVerifier? appleVerifier}) {
   final r = Router();
+  final appleBilling = AppleBillingService(
+      db, appleVerifier ?? UnconfiguredAppleVerifier());
 
   Response ok(Object body) => Response.ok(jsonEncode(body),
       headers: {'content-type': 'application/json; charset=utf-8'});
@@ -693,6 +696,7 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         'level': u['level'],
         'role': u['role'] ?? 'user',
         'entitlements': db.userEntitlements(u['id'] as int),
+        'billingAccountToken': db.billingAccountToken(u['id'] as int),
       };
 
   String tokenFor(Map<String, dynamic> user) => signJwt({
@@ -807,6 +811,10 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
   // ============================================================
   final gplay = GooglePlayVerifier(Platform.environment);
   final catalog = BillingCatalog(Platform.environment);
+  final gplayEnvironment =
+      Platform.environment['XSGO_GPLAY_ENV'] == 'Sandbox'
+          ? 'Sandbox'
+          : 'Production';
   // Công tắc BÁN HÀNG phía server (đồng bộ với kSellingEnabled trong app):
   // bật = enforce quota xem/nhập video. Đặt: POST /admin/config {selling_enabled:'1'}
   bool sellingEnabled() => (db.allConfig()['selling_enabled'] ?? '0') == '1';
@@ -837,6 +845,34 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       state: v.state,
       orderId: v.orderId,
       expiryMs: v.expiryMs,
+    );
+    // Dual-write ledger mới bằng hash của purchaseToken; API/bảng legacy vẫn
+    // nguyên vẹn cho Android versionCode 2. Không lưu thêm raw token vào ledger.
+    final ledgerId = sha256.convert(utf8.encode(token)).toString();
+    final accountToken = db.billingAccountToken(uid);
+    db.upsertStoreTransaction(
+      store: 'google_play',
+      environment: gplayEnvironment,
+      transactionId: ledgerId,
+      originalTransactionId: ledgerId,
+      userId: uid,
+      accountToken: accountToken,
+      productId: productId,
+      entitlementKey: entKey,
+      kind: isSub ? 'subscription' : 'non_consumable',
+      status: v.state,
+      purchasedAt: 0,
+      expiresAt: v.expiryMs,
+      revokedAt: v.state == 'revoked' ? DateTime.now().millisecondsSinceEpoch : 0,
+    );
+    db.upsertStoreEntitlementGrant(
+      store: 'google_play',
+      environment: gplayEnvironment,
+      transactionId: ledgerId,
+      userId: uid,
+      entitlementKey: entKey,
+      status: v.state,
+      expiresAt: v.expiryMs,
     );
     if (v.state == 'active') {
       // Mua đứt: trọn đời (expires 0). Subscription: hết hạn theo Google —
@@ -1712,6 +1748,77 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     return ok(planFor(uid));
   });
 
+  // appAccountToken UUID ổn định theo XS GO account. Không chứa email/PII;
+  // StoreKit 2 ký token này vào transaction để server kiểm ownership.
+  r.get('/me/billing-context', (Request req) {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    return ok({
+      'appAccountToken': db.billingAccountToken(uid),
+      'activeSubscription': db.hasActiveStoreSubscription(uid),
+    });
+  });
+
+  // ============================================================
+  //  APPLE BILLING — routes fail closed cho tới khi trust adapter configured
+  // ============================================================
+  r.post('/billing/apple/verify', (Request req) async {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    if (!appleBilling.configured) {
+      return bad('Apple verification chưa được cấu hình', code: 503);
+    }
+    if (_limited('applebill:u$uid', 30, 3600 * 1000)) {
+      return bad('Quá nhiều yêu cầu, thử lại sau', code: 429);
+    }
+    try {
+      final b = await readJson(req);
+      final signed = ((b['signedTransaction'] as String?) ?? '').trim();
+      if (signed.isEmpty || signed.length > 65536) {
+        return bad('Thiếu hoặc sai signedTransaction');
+      }
+      // Product/entitlement client gửi kèm (nếu có) bị bỏ qua. Chỉ verified
+      // Apple evidence quyết định product và quyền.
+      final result = await appleBilling.verifyPurchase(uid, signed);
+      return ok({'status': result.status, 'owned': result.owned});
+    } on AppleVerificationUnavailable {
+      return bad('Apple verification chưa được cấu hình', code: 503);
+    } on AppleOwnershipConflict {
+      return bad('Giao dịch đã gắn với XS GO account khác', code: 409);
+    } on AppleEvidenceRejected catch (e) {
+      return bad(e.message, code: 400);
+    } catch (e) {
+      stderr.writeln('[apple-billing] verify failed (${e.runtimeType})');
+      return bad('Không xác minh được giao dịch Apple', code: 502);
+    }
+  });
+
+  r.post('/billing/apple/notifications/v2', (Request req) async {
+    if (!appleBilling.configured) {
+      return bad('Apple notifications verification chưa cấu hình', code: 503);
+    }
+    try {
+      final b = await readJson(req);
+      final signed = ((b['signedPayload'] as String?) ?? '').trim();
+      if (signed.isEmpty || signed.length > 262144) {
+        return bad('Thiếu hoặc sai signedPayload');
+      }
+      final processed = await appleBilling.processNotification(signed);
+      return ok({'ok': true, 'processed': processed});
+    } on AppleVerificationUnavailable {
+      return bad('Apple notifications verification chưa cấu hình', code: 503);
+    } on AppleEvidenceRejected catch (e) {
+      return bad(e.message, code: 400);
+    } on AppleOwnershipConflict {
+      return bad('Notification ownership conflict', code: 409);
+    } catch (e) {
+      // Trả non-2xx để Apple retry; event inbox giữ payload đã verify cho lần
+      // xử lý kế tiếp. Không log raw JWS hoặc transaction identifiers.
+      stderr.writeln('[apple-billing] notification failed (${e.runtimeType})');
+      return bad('Không xử lý được Apple notification', code: 503);
+    }
+  });
+
   // ============================================================
   //  GOOGLE PLAY BILLING — routes
   // ============================================================
@@ -1771,7 +1878,23 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     }
     try {
       final b = await readJson(req);
-      final data = (b['message'] as Map<String, dynamic>?)?['data'] as String?;
+      final message = b['message'] as Map<String, dynamic>?;
+      final data = message?['data'] as String?;
+      final messageId = (message?['messageId'] ?? message?['message_id'])
+          ?.toString();
+      final eventId = (messageId != null && messageId.isNotEmpty)
+          ? messageId
+          : sha256.convert(utf8.encode(data ?? jsonEncode(b))).toString();
+      final payloadHash = sha256.convert(utf8.encode(jsonEncode(b))).toString();
+      final shouldProcess = db.beginStoreEvent(
+        store: 'google_play',
+        environment: gplayEnvironment,
+        eventId: eventId,
+        eventType: 'RTDN',
+        payloadHash: payloadHash,
+        signedPayload: data ?? '',
+      );
+      if (!shouldProcess) return ok({'ok': true, 'processed': false});
       if (data != null) {
         final n = jsonDecode(utf8.decode(base64.decode(data)))
             as Map<String, dynamic>;
@@ -1797,16 +1920,46 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
                 state: 'revoked',
                 expiryMs: 0);
             if (entKey != null) db.revokeEntitlement(uid, entKey);
+            final ledgerId = sha256.convert(utf8.encode(token)).toString();
+            db.upsertStoreTransaction(
+              store: 'google_play',
+              environment: gplayEnvironment,
+              transactionId: ledgerId,
+              originalTransactionId: ledgerId,
+              userId: uid,
+              accountToken: db.billingAccountToken(uid),
+              productId: productId,
+              entitlementKey: entKey ?? '',
+              kind: p['kind'] == 'subs' ? 'subscription' : 'non_consumable',
+              status: 'revoked',
+              purchasedAt: 0,
+              revokedAt: DateTime.now().millisecondsSinceEpoch,
+            );
+            if (entKey != null) {
+              db.upsertStoreEntitlementGrant(
+                store: 'google_play',
+                environment: gplayEnvironment,
+                transactionId: ledgerId,
+                userId: uid,
+                entitlementKey: entKey,
+                status: 'revoked',
+              );
+            }
           } else if (gplay.enabled) {
             await applyVerified(uid, productId, token!);
           }
         }
       }
+      db.completeStoreEvent(
+        store: 'google_play',
+        environment: gplayEnvironment,
+        eventId: eventId,
+      );
+      return ok({'ok': true, 'processed': true});
     } catch (e) {
       stderr.writeln('[billing] RTDN lỗi: $e');
+      return bad('RTDN xử lý lỗi, sẽ retry', code: 503);
     }
-    // LUÔN 200 — trả lỗi là Pub/Sub retry dồn dập.
-    return ok({'ok': true});
   });
 
   // -------- entitlements của chính mình (app kéo về sau login) --------
