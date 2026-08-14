@@ -905,15 +905,37 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         headers: {'content-type': 'text/html; charset=utf-8'},
       );
 
+  r.get('/support', (Request req) => htmlPage('Hỗ trợ', '''
+    <h1>Hỗ trợ XS GO</h1><p>Cập nhật: 14/08/2026</p>
+    <p>Nếu bạn cần trợ giúp về tài khoản, nội dung học, đồng bộ tiến độ hoặc
+    giao dịch trong ứng dụng, hãy gửi email tới
+    <a href="mailto:$supportEmail">$supportEmail</a>.</p>
+    <h2>Thông tin nên gửi kèm</h2>
+    <ul>
+      <li>Email tài khoản XS GO (nếu có)</li>
+      <li>Thiết bị, phiên bản hệ điều hành và mô tả vấn đề</li>
+      <li>Ảnh chụp màn hình không chứa mật khẩu hoặc thông tin nhạy cảm</li>
+    </ul>
+    <h2>Câu hỏi thường gặp</h2>
+    <p><strong>Đổi thiết bị:</strong> đăng nhập cùng tài khoản để khôi phục dữ
+    liệu đã đồng bộ. Nếu giao dịch hợp lệ chưa xuất hiện, dùng chức năng khôi
+    phục mua hàng trong ứng dụng hoặc liên hệ hỗ trợ.</p>
+    <p><strong>Xoá tài khoản:</strong> xem hướng dẫn tại
+    <a href="/delete-account">Xoá tài khoản &amp; dữ liệu</a>.</p>
+    <p><a href="/privacy">Chính sách bảo mật</a> ·
+    <a href="/terms">Điều khoản sử dụng</a></p>'''));
+
   r.get('/privacy', (Request req) => htmlPage('Chính sách bảo mật', '''
-    <h1>Chính sách bảo mật</h1><p>Cập nhật: 11/08/2026</p>
+    <h1>Chính sách bảo mật</h1><p>Cập nhật: 14/08/2026</p>
     <p><strong>Nhà phát triển:</strong> XS GO. <strong>Liên hệ:</strong>
     <a href="mailto:$supportEmail">$supportEmail</a></p>
     <h2>1. Thông tin thu thập</h2><p>Email (khi đăng ký), ngôn ngữ mẹ đẻ, trình độ,
     tiến độ học (streak, số từ, bài đã học), kho từ vựng bạn lưu,
     <strong>lịch sử xem video</strong> (để tiếp tục xem và đo hạn mức gói Free),
-    <strong>video YouTube bạn tự thêm</strong>, <strong>nội dung bạn nhập khi luyện
-    nói với AI</strong>, và <strong>lịch sử mua hàng</strong> (do Google Play xử lý).
+    <strong>video YouTube bạn tự thêm</strong> và phản hồi bạn gửi. Khi tính năng
+    mua hàng được cung cấp, chúng tôi còn xử lý mã giao dịch, sản phẩm, trạng
+    thái và thời hạn quyền truy cập do cửa hàng ứng dụng cung cấp; chúng tôi
+    không nhận hay lưu thông tin thẻ thanh toán.
     Đăng nhập bằng Google/Apple: nhận email và mã định danh do nhà cung cấp cấp.</p>
     <p>Chúng tôi <strong>KHÔNG</strong> thu thập vị trí, danh bạ, ảnh, và
     <strong>KHÔNG</strong> dùng Advertising ID — ứng dụng không có quảng cáo.</p>
@@ -931,8 +953,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       <li><strong>Groq</strong> (nhận dạng giọng nói để tạo phụ đề)</li>
       <li><strong>Google / YouTube</strong> (phát video nhúng, đăng nhập Google)</li>
       <li><strong>Apple</strong> (đăng nhập Apple, nếu bạn chọn)</li>
-      <li><strong>Google Play</strong> (thanh toán trong ứng dụng — chúng tôi không
-          nhận và không lưu thông tin thẻ của bạn)</li>
+      <li><strong>Cửa hàng ứng dụng trên thiết bị</strong> (xử lý giao dịch trong
+          ứng dụng khi tính năng này được cung cấp)</li>
     </ul>
     <h2>5. Lưu trữ &amp; bảo mật</h2><p>Dữ liệu lưu trên máy chủ XS GO (Fly.io,
     khu vực Singapore); mật khẩu được băm; toàn bộ kết nối dùng HTTPS.
@@ -944,7 +966,7 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     <h2>7. Trẻ em</h2><p>Ứng dụng dành cho người từ 16 tuổi trở lên và không hướng tới trẻ em.</p>'''));
 
   r.get('/terms', (Request req) => htmlPage('Điều khoản sử dụng', '''
-    <h1>Điều khoản sử dụng</h1><p>Cập nhật: 11/08/2026</p>
+    <h1>Điều khoản sử dụng</h1><p>Cập nhật: 14/08/2026</p>
     <h2>1. Chấp nhận</h2><p>Sử dụng XS GO nghĩa là bạn đồng ý các điều khoản này.</p>
     <h2>2. Tài khoản</h2><p>Bạn tự bảo mật tài khoản/mật khẩu và cung cấp thông tin chính xác.
     Bạn có thể xoá tài khoản bất cứ lúc nào — xem
@@ -959,29 +981,19 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     Vi phạm sẽ bị gỡ nội dung và khoá tài khoản vĩnh viễn, không hoàn tiền.
     Mọi người dùng có thể báo cáo nội dung ngay trong ứng dụng (nút cờ 🚩 ở màn xem video);
     chúng tôi xem xét và xử lý trong vòng 24–48 giờ.</p>
-    <h2>5. Gói trả phí &amp; thanh toán</h2>
-    <p>Thanh toán thực hiện qua <strong>Google Play</strong>. Giá áp dụng là giá hiển thị tại
-    thời điểm mua, đã bao gồm thuế theo quy định của Google Play.</p>
-    <ul>
-      <li><strong>Video Premium theo tháng</strong> — ¥1.500/tháng, <strong>tự động gia hạn</strong>
-          mỗi tháng cho tới khi bạn huỷ.</li>
-      <li><strong>Video Premium theo năm</strong> — ¥9.999/năm, <strong>tự động gia hạn</strong>
-          mỗi năm cho tới khi bạn huỷ.</li>
-      <li><strong>Khoá BJT</strong> — ¥7.999, mua một lần, dùng trọn đời.</li>
-      <li><strong>Tokutei theo ngành</strong> — ¥9.999/ngành, mua một lần, dùng trọn đời.</li>
-      <li><strong>All Access</strong> — ¥19.999, mua một lần, mở toàn bộ, dùng trọn đời.</li>
-    </ul>
-    <p><strong>Huỷ gia hạn:</strong> mở ứng dụng Google Play → ảnh đại diện →
-    Thanh toán và gói đăng ký → Gói đăng ký → chọn XS GO → Huỷ. Việc huỷ có hiệu lực từ
-    chu kỳ kế tiếp; bạn vẫn dùng được tới hết chu kỳ đã trả tiền.
-    <strong>Hoàn tiền</strong> theo chính sách của Google Play; bạn cũng có thể liên hệ
-    <a href="mailto:$supportEmail">$supportEmail</a> để được hỗ trợ.
-    Gói Free được xem tối đa 3 giờ video mỗi tháng, tự làm mới vào đầu tháng.</p>
+    <h2>5. Giao dịch trong ứng dụng</h2>
+    <p>Khi XS GO cung cấp sản phẩm trả phí, tên sản phẩm, giá, kỳ hạn và điều
+    kiện gia hạn được hiển thị bởi cửa hàng ứng dụng trên thiết bị trước khi bạn
+    xác nhận. Gói đăng ký tiếp tục gia hạn cho tới khi bạn huỷ trong phần quản lý
+    đăng ký của cửa hàng. Quy trình hoàn tiền tuân theo chính sách của cửa hàng
+    nơi giao dịch được thực hiện. Bạn có thể liên hệ
+    <a href="mailto:$supportEmail">$supportEmail</a> để được hỗ trợ.</p>
+    <p>Gói Free được xem tối đa 3 giờ video mỗi tháng và tự làm mới vào đầu
+    tháng. Quyền lợi hiện hành trong ứng dụng là thông tin áp dụng cho tài khoản.</p>
     <h2>6. Giới hạn trách nhiệm</h2><p>XS GO là công cụ hỗ trợ học, không cam kết kết quả thi
     cụ thể; dịch vụ có thể thay đổi hoặc gián đoạn.</p>'''));
 
-  // Trang XOÁ TÀI KHOẢN công khai — Google Play BẮT BUỘC với app cho tạo tài
-  // khoản: người dùng phải yêu cầu xoá được mà KHÔNG cần cài app.
+  // Trang XOÁ TÀI KHOẢN công khai để người dùng yêu cầu xoá mà không cần app.
   r.get('/delete-account', (Request req) => htmlPage('Xoá tài khoản & dữ liệu', '''
     <h1>Xoá tài khoản &amp; dữ liệu — XS GO</h1>
     <p>Ứng dụng: <strong>XS GO</strong> (com.xsgo.xs_go). Nhà phát triển: XS GO.</p>
@@ -1003,19 +1015,20 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       <li>Lịch sử xem video và hạn mức đã dùng</li>
       <li>Video bạn tự thêm</li>
       <li>Phản hồi/báo cáo bạn đã gửi (email trong phản hồi được xoá)</li>
-      <li>Quyền sở hữu khoá học đã mua</li>
+      <li>Quyền truy cập nội dung gắn với tài khoản XS GO</li>
     </ul>
     <h2>Dữ liệu được GIỮ LẠI và lý do</h2>
     <ul>
-      <li><strong>Hoá đơn/giao dịch do Google Play lưu giữ</strong> — chúng tôi không
-          kiểm soát; giữ theo yêu cầu kế toán và chống gian lận của Google.
-          Xem <a href="https://policies.google.com/privacy">chính sách của Google</a>.</li>
+      <li><strong>Lịch sử giao dịch do cửa hàng ứng dụng lưu giữ</strong> — nằm
+          ngoài tài khoản XS GO và tuân theo chính sách lưu trữ của cửa hàng nơi
+          giao dịch được thực hiện.</li>
       <li><strong>Nhật ký máy chủ ẩn danh</strong> (không chứa danh tính) — tối đa 30 ngày.</li>
     </ul>
     <p style="background:#FEF3C7;padding:12px;border-radius:8px">
-    ⚠️ <strong>Lưu ý:</strong> xoá tài khoản sẽ mất quyền truy cập các khoá học đã mua và
-    <strong>không thể khôi phục</strong>. Nếu bạn chỉ muốn ngừng gói đăng ký, hãy huỷ trong
-    Google Play thay vì xoá tài khoản.</p>'''));
+    ⚠️ <strong>Lưu ý:</strong> xoá tài khoản XS GO không tự động huỷ một gói
+    đăng ký đang hoạt động tại cửa hàng ứng dụng. Hãy quản lý hoặc huỷ gói trong
+    phần quản lý đăng ký của cửa hàng trước khi xoá tài khoản. Sau khi xoá, bạn
+    sẽ mất quyền truy cập nội dung gắn với tài khoản XS GO.</p>'''));
 
   // -------- auth --------
   r.post('/auth/register', (Request req) async {
@@ -1879,6 +1892,21 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     'saleBadge', // nhãn khuyến mãi ở màn mua, vd "🔥 Sale 8/8 · giảm 50%"
     'premium_enabled',
     'selling_enabled', // công tắc bán hàng server (đồng bộ kSellingEnabled app)
+    // Namespace mới theo nền tảng. Giữ nguyên toàn bộ key legacy phía trên để
+    // Android versionCode 2 tiếp tục nhận đúng contract hiện tại.
+    'announce_android',
+    'announce_my_android',
+    'announce_id_android',
+    'announce_ne_android',
+    'bjtPrice_android',
+    'tokuteiPrice_android',
+    'saleBadge_android',
+    'selling_enabled_android',
+    'announce_ios',
+    'announce_my_ios',
+    'announce_id_ios',
+    'announce_ne_ios',
+    'selling_enabled_ios',
   };
   r.get('/config', (Request req) {
     final all = db.allConfig();
