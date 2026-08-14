@@ -695,6 +695,12 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
         'entitlements': db.userEntitlements(u['id'] as int),
       };
 
+  String tokenFor(Map<String, dynamic> user) => signJwt({
+        'sub': user['id'],
+        'email': user['email'],
+        'ver': user['token_version'] as int? ?? 0,
+      });
+
   /// Tự nâng quyền admin nếu email khớp cấu hình. Trả về user (đã cập nhật).
   Map<String, dynamic> ensureRole(Map<String, dynamic> u) {
     if ((u['email'] as String).toLowerCase() == adminEmail &&
@@ -723,6 +729,8 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     // (admin khoá là chặn NGAY, không đợi token hết hạn 30 ngày).
     final u = db.userById(uid);
     if (u == null || (u['disabled'] as int? ?? 0) == 1) return null;
+    final tokenVersion = claims?['ver'] as int? ?? 0;
+    if (tokenVersion != (u['token_version'] as int? ?? 0)) return null;
     return uid;
   }
 
@@ -1041,7 +1049,7 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       (b['level'] as String?) ?? 'N5',
     );
     final u = ensureRole(db.userById(id)!);
-    final token = signJwt({'sub': id, 'email': email});
+    final token = tokenFor(u);
     return ok({'token': token, 'user': publicUser(u)});
   });
 
@@ -1063,7 +1071,7 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
       return bad('Tài khoản đã bị khoá', code: 403);
     }
     final u = ensureRole(u0);
-    final token = signJwt({'sub': u['id'], 'email': email});
+    final token = tokenFor(u);
     return ok({'token': token, 'user': publicUser(u)});
   });
 
@@ -1135,8 +1143,17 @@ Router buildRouter(Db db, Ai ai, Asr asr) {
     }
     // KHÔNG gọi ensureRole ở đây — quyền admin chỉ cấp qua /auth/register có
     // bootstrap secret hoặc do admin sẵn có nâng quyền trong tab Quản trị.
-    final jwt = signJwt({'sub': u['id'], 'email': u['email']});
+    final jwt = tokenFor(u);
     return ok({'token': jwt, 'user': publicUser(u)});
+  });
+
+  // Logout is intentionally account-wide: a copied token on a lost device
+  // must stop working too. The app still clears its local session if offline.
+  r.post('/auth/logout', (Request req) {
+    final uid = authUserId(req);
+    if (uid == null) return bad('Cần đăng nhập', code: 401);
+    db.revokeUserTokens(uid);
+    return ok({'ok': true});
   });
 
   // -------- TRA NGHĨA TỪ (bấm vào từ trong phụ đề) --------
