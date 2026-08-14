@@ -1,7 +1,10 @@
 .dart_tool/
 build/
+node_modules/
 *.db
 *.db-shm
 *.db-wal
 .env
+*.p8
+*private*key*
 .DS_Store
