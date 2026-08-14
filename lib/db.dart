@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:sqlite3/sqlite3.dart';
 
 /// Lớp truy cập SQLite. File DB mặc định `xs_go.db` cạnh binary.
@@ -37,6 +38,11 @@ class Db {
     _safeAddColumn('users', 'disabled', 'INTEGER NOT NULL DEFAULT 0');
     // Incremented by logout to invalidate every JWT issued before it.
     _safeAddColumn('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
+    // UUID v4 ổn định theo account, không chứa PII; StoreKit trả lại
+    // trong transaction để backend bind purchase đúng XS GO account.
+    _safeAddColumn('users', 'billing_account_token', 'TEXT');
+    _db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_billing_token '
+        'ON users(billing_account_token) WHERE billing_account_token IS NOT NULL');
     // Premium: premium_until = mốc hết hạn (ms epoch; 0 = không; sentinel lớn =
     // vĩnh viễn). trial_used = 1 khi đã dùng bản dùng thử 3 ngày (mỗi user 1 lần).
     _safeAddColumn('users', 'premium_until', 'INTEGER NOT NULL DEFAULT 0');
@@ -234,6 +240,74 @@ class Db {
         updated_at INTEGER NOT NULL
       );
     ''');
+    // Unified Apple/Google ledger. Khi user xoá account, transaction history
+    // cần cho reconciliation được giữ lại với user_id = NULL.
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS store_transactions (
+        store TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        transaction_id TEXT NOT NULL,
+        original_transaction_id TEXT NOT NULL,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        account_token TEXT NOT NULL,
+        product_id TEXT NOT NULL,
+        entitlement_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        purchased_at INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        revoked_at INTEGER NOT NULL DEFAULT 0,
+        state_changed_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (store, environment, transaction_id)
+      );
+    ''');
+    _safeAddColumn('store_transactions', 'state_changed_at',
+        'INTEGER NOT NULL DEFAULT 0');
+    _db.execute('CREATE INDEX IF NOT EXISTS idx_store_tx_original '
+        'ON store_transactions(store, environment, original_transaction_id)');
+    _db.execute('CREATE INDEX IF NOT EXISTS idx_store_tx_account '
+        'ON store_transactions(account_token)');
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS store_entitlement_grants (
+        store TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        transaction_id TEXT NOT NULL,
+        original_transaction_id TEXT NOT NULL DEFAULT '',
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        entitlement_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        state_changed_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (store, environment, transaction_id, entitlement_key)
+      );
+    ''');
+    _safeAddColumn('store_entitlement_grants', 'original_transaction_id',
+        "TEXT NOT NULL DEFAULT ''");
+    _safeAddColumn('store_entitlement_grants', 'state_changed_at',
+        'INTEGER NOT NULL DEFAULT 0');
+    _db.execute('CREATE INDEX IF NOT EXISTS idx_store_grants_user '
+        'ON store_entitlement_grants(user_id, entitlement_key)');
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS store_event_inbox (
+        store TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        signed_payload TEXT NOT NULL,
+        signed_at INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'processing',
+        attempts INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (store, environment, event_id)
+      );
+    ''');
+    _safeAddColumn(
+        'store_event_inbox', 'signed_at', 'INTEGER NOT NULL DEFAULT 0');
     // Quota XEM video của Free (3h/tháng): period_key = 'V:yyyy-mm'.
     _db.execute('''
       CREATE TABLE IF NOT EXISTS video_usage (
@@ -523,8 +597,17 @@ class Db {
   List<String> userEntitlements(int userId) {
     final r = _db.select(
         'SELECT course_key FROM entitlements '
-        'WHERE user_id = ? AND (expires_at = 0 OR expires_at > ?)',
-        [userId, DateTime.now().millisecondsSinceEpoch]);
+        'WHERE user_id = ? AND (expires_at = 0 OR expires_at > ?) '
+        'UNION '
+        'SELECT entitlement_key AS course_key FROM store_entitlement_grants '
+        "WHERE user_id = ? AND status IN ('active','grace') "
+        'AND (expires_at = 0 OR expires_at > ?)',
+        [
+          userId,
+          DateTime.now().millisecondsSinceEpoch,
+          userId,
+          DateTime.now().millisecondsSinceEpoch
+        ]);
     return r.map((e) => e['course_key'] as String).toList();
   }
 
@@ -587,6 +670,329 @@ class Db {
         'AND state = ? AND expiry_ms > 0 AND expiry_ms < ?',
         [userId, 'active', nowMs]);
     return r.map((e) => Map<String, dynamic>.from(e)).toList();
+  }
+
+  // ---------------- Unified store ledger ----------------
+
+  String billingAccountToken(int userId) {
+    final rows = _db.select(
+        'SELECT billing_account_token FROM users WHERE id = ?', [userId]);
+    if (rows.isEmpty) throw StateError('Account không tồn tại');
+    final existing = rows.first['billing_account_token'] as String?;
+    if (existing != null && existing.isNotEmpty) return existing;
+    final token = _uuidV4();
+    _db.execute('UPDATE users SET billing_account_token = ? WHERE id = ?',
+        [token, userId]);
+    return token;
+  }
+
+  int? userIdByBillingAccountToken(String token) {
+    final rows = _db.select(
+        'SELECT id FROM users WHERE billing_account_token = ?', [token]);
+    return rows.isEmpty ? null : rows.first['id'] as int;
+  }
+
+  static String _uuidV4() {
+    final bytes = List<int>.generate(16, (_) => Random.secure().nextInt(256));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    final h = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return '${h.substring(0, 8)}-${h.substring(8, 12)}-'
+        '${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
+  }
+
+  Map<String, dynamic>? storeTransaction({
+    required String store,
+    required String environment,
+    required String transactionId,
+  }) {
+    final rows = _db.select(
+        'SELECT * FROM store_transactions '
+        'WHERE store = ? AND environment = ? AND transaction_id = ?',
+        [store, environment, transactionId]);
+    return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
+  }
+
+  List<Map<String, dynamic>> storeTransactionsForUser(int userId) => _db
+      .select('SELECT * FROM store_transactions WHERE user_id = ?', [userId])
+      .map((r) => Map<String, dynamic>.from(r))
+      .toList();
+
+  bool hasActiveStoreSubscription(int userId) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final unified = _db.select(
+        "SELECT 1 FROM store_transactions WHERE user_id=? AND kind='subscription' "
+        "AND status IN ('active','grace') AND (expires_at=0 OR expires_at>?) "
+        'LIMIT 1',
+        [userId, now]);
+    if (unified.isNotEmpty) return true;
+    // Legacy Google rows vẫn authoritative cho Android build 2.
+    return _db.select(
+        "SELECT 1 FROM purchases WHERE user_id=? AND kind='subs' "
+        "AND state='active' AND (expiry_ms=0 OR expiry_ms>?) LIMIT 1",
+        [userId, now]).isNotEmpty;
+  }
+
+  Map<String, dynamic>? storeTransactionByOriginal({
+    required String store,
+    required String environment,
+    required String originalTransactionId,
+  }) {
+    final rows = _db.select(
+        'SELECT * FROM store_transactions WHERE store = ? AND environment = ? '
+        'AND original_transaction_id = ? ORDER BY state_changed_at DESC, '
+        "CASE status WHEN 'revoked' THEN 60 WHEN 'refunded' THEN 55 "
+        "WHEN 'expired' THEN 50 WHEN 'canceled' THEN 45 WHEN 'grace' THEN 20 "
+        "WHEN 'active' THEN 10 ELSE 0 END DESC, transaction_id DESC LIMIT 1",
+        [store, environment, originalTransactionId]);
+    return rows.isEmpty ? null : Map<String, dynamic>.from(rows.first);
+  }
+
+  static int _storeStateRank(String status) => switch (status) {
+        'revoked' => 60,
+        'refunded' => 55,
+        'expired' => 50,
+        'canceled' => 45,
+        'grace' => 20,
+        'active' => 10,
+        _ => 0,
+      };
+
+  static bool _newerStoreState(
+      Map<String, dynamic>? current, int timestamp, String status) {
+    if (current == null) return true;
+    final currentTimestamp = current['state_changed_at'] as int? ?? 0;
+    if (timestamp != currentTimestamp) return timestamp > currentTimestamp;
+    return _storeStateRank(status) >
+        _storeStateRank(current['status'] as String? ?? '');
+  }
+
+  bool upsertStoreTransaction({
+    required String store,
+    required String environment,
+    required String transactionId,
+    required String originalTransactionId,
+    required int userId,
+    required String accountToken,
+    required String productId,
+    required String entitlementKey,
+    required String kind,
+    required String status,
+    required int purchasedAt,
+    int expiresAt = 0,
+    int revokedAt = 0,
+    required int stateChangedAt,
+  }) {
+    final existing = storeTransaction(
+        store: store,
+        environment: environment,
+        transactionId: transactionId);
+    if (existing != null &&
+        (existing['user_id'] != userId ||
+            existing['account_token'] != accountToken ||
+            existing['product_id'] != productId ||
+            existing['original_transaction_id'] != originalTransactionId)) {
+      throw StateError('Transaction ownership/product mismatch');
+    }
+    final current = storeTransactionByOriginal(
+        store: store,
+        environment: environment,
+        originalTransactionId: originalTransactionId);
+    if (current != null &&
+        (current['user_id'] != userId ||
+            current['account_token'] != accountToken ||
+            current['product_id'] != productId)) {
+      throw StateError('Transaction chain ownership/product mismatch');
+    }
+    if (!_newerStoreState(current, stateChangedAt, status)) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'UPDATE store_transactions SET status=?, expires_at=?, revoked_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND original_transaction_id=?',
+        [status, expiresAt, revokedAt, stateChangedAt, now, store, environment,
+          originalTransactionId]);
+    _db.execute(
+        'INSERT INTO store_transactions '
+        '(store,environment,transaction_id,original_transaction_id,user_id,'
+        'account_token,product_id,entitlement_key,kind,status,purchased_at,'
+        'expires_at,revoked_at,state_changed_at,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '
+        'ON CONFLICT(store,environment,transaction_id) DO UPDATE SET '
+        'status=excluded.status, expires_at=excluded.expires_at, '
+        'revoked_at=excluded.revoked_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
+        [
+          store,
+          environment,
+          transactionId,
+          originalTransactionId,
+          userId,
+          accountToken,
+          productId,
+          entitlementKey,
+          kind,
+          status,
+          purchasedAt,
+          expiresAt,
+          revokedAt,
+          stateChangedAt,
+          now,
+          now
+        ]);
+    return true;
+  }
+
+  bool upsertDetachedStoreTransaction({
+    required String store,
+    required String environment,
+    required String transactionId,
+    required String originalTransactionId,
+    required String accountToken,
+    required String productId,
+    required String entitlementKey,
+    required String kind,
+    required String status,
+    required int purchasedAt,
+    int expiresAt = 0,
+    int revokedAt = 0,
+    required int stateChangedAt,
+  }) {
+    final original = storeTransactionByOriginal(
+        store: store,
+        environment: environment,
+        originalTransactionId: originalTransactionId);
+    if (original == null ||
+        original['user_id'] != null ||
+        original['account_token'] != accountToken ||
+        original['product_id'] != productId) {
+      throw StateError('Detached transaction identity mismatch');
+    }
+    if (!_newerStoreState(original, stateChangedAt, status)) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'UPDATE store_transactions SET status=?, expires_at=?, revoked_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND original_transaction_id=?',
+        [status, expiresAt, revokedAt, stateChangedAt, now, store, environment,
+          originalTransactionId]);
+    _db.execute(
+        'INSERT INTO store_transactions '
+        '(store,environment,transaction_id,original_transaction_id,user_id,'
+        'account_token,product_id,entitlement_key,kind,status,purchased_at,'
+        'expires_at,revoked_at,state_changed_at,created_at,updated_at) '
+        'VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?) '
+        'ON CONFLICT(store,environment,transaction_id) DO UPDATE SET '
+        'status=excluded.status, expires_at=excluded.expires_at, '
+        'revoked_at=excluded.revoked_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
+        [
+          store,
+          environment,
+          transactionId,
+          originalTransactionId,
+          accountToken,
+          productId,
+          entitlementKey,
+          kind,
+          status,
+          purchasedAt,
+          expiresAt,
+          revokedAt,
+          stateChangedAt,
+          now,
+          now
+        ]);
+    return true;
+  }
+
+  bool upsertStoreEntitlementGrant({
+    required String store,
+    required String environment,
+    required String transactionId,
+    required String originalTransactionId,
+    required int userId,
+    required String entitlementKey,
+    required String status,
+    int expiresAt = 0,
+    required int stateChangedAt,
+  }) {
+    final rows = _db.select(
+        'SELECT status,state_changed_at FROM store_entitlement_grants '
+        'WHERE store=? AND environment=? AND user_id=? '
+        'AND original_transaction_id=? AND entitlement_key=? '
+        'ORDER BY state_changed_at DESC LIMIT 1',
+        [store, environment, userId, originalTransactionId, entitlementKey]);
+    final current = rows.isEmpty
+        ? null
+        : Map<String, dynamic>.from(rows.first);
+    if (!_newerStoreState(current, stateChangedAt, status)) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'UPDATE store_entitlement_grants SET status=?, expires_at=?, '
+        'state_changed_at=?, updated_at=? WHERE store=? AND environment=? '
+        'AND user_id=? AND original_transaction_id=? AND entitlement_key=?',
+        [status, expiresAt, stateChangedAt, now, store, environment, userId,
+          originalTransactionId, entitlementKey]);
+    _db.execute(
+        'INSERT INTO store_entitlement_grants '
+        '(store,environment,transaction_id,original_transaction_id,user_id,'
+        'entitlement_key,status,expires_at,state_changed_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?) '
+        'ON CONFLICT(store,environment,transaction_id,entitlement_key) '
+        'DO UPDATE SET original_transaction_id=excluded.original_transaction_id, '
+        'status=excluded.status, expires_at=excluded.expires_at, '
+        'state_changed_at=excluded.state_changed_at, updated_at=excluded.updated_at',
+        [store, environment, transactionId, originalTransactionId, userId,
+          entitlementKey, status, expiresAt, stateChangedAt, now]);
+    return true;
+  }
+
+  bool beginStoreEvent({
+    required String store,
+    required String environment,
+    required String eventId,
+    required String eventType,
+    required String payloadHash,
+    required String signedPayload,
+    required int signedAt,
+  }) {
+    final rows = _db.select(
+        'SELECT status, payload_hash FROM store_event_inbox '
+        'WHERE store=? AND environment=? AND event_id=?',
+        [store, environment, eventId]);
+    if (rows.isNotEmpty) {
+      if (rows.first['payload_hash'] != payloadHash) {
+        throw StateError('Event ID payload mismatch');
+      }
+      if (rows.first['status'] == 'processed') return false;
+      _db.execute(
+          'UPDATE store_event_inbox SET attempts=attempts+1, '
+          "status='processing', updated_at=? "
+          'WHERE store=? AND environment=? AND event_id=?',
+          [DateTime.now().millisecondsSinceEpoch, store, environment, eventId]);
+      return true;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(
+        'INSERT INTO store_event_inbox '
+        '(store,environment,event_id,event_type,payload_hash,signed_payload,'
+        'signed_at,status,attempts,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?, ?,1,?,?)',
+        [store, environment, eventId, eventType, payloadHash, signedPayload,
+          signedAt, 'processing', now, now]);
+    return true;
+  }
+
+  void completeStoreEvent({
+    required String store,
+    required String environment,
+    required String eventId,
+  }) {
+    _db.execute(
+        "UPDATE store_event_inbox SET status='processed', updated_at=? "
+        'WHERE store=? AND environment=? AND event_id=?',
+        [DateTime.now().millisecondsSinceEpoch, store, environment, eventId]);
   }
 
   // ---------------- Quota video (xem + nhập) ----------------

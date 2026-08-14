@@ -42,3 +42,20 @@ flutter build apk --dart-define=XSGO_API=https://xs-go-server.fly.dev
 | `GROQ_API_KEY` | Nên có | Bật AI bóc tiếng (Whisper) để TẠO PHỤ ĐỀ tự động |
 | `XSGO_AI_MODEL` | — | `claude-haiku-4-5` nếu muốn rẻ |
 | `XSGO_DB` | — | Mặc định `/data/xs_go.db` trong Docker |
+
+## Phase 3B — Apple notification policy/backlog
+
+- Permanent malformed input (invalid/oversized JSON or missing/oversized
+  `signedPayload`) and evidence rejected by the configured JWS verifier are
+  acknowledged with HTTP 200 plus `discarded: true`. They cannot become valid
+  through retry. Transient verifier/config/runtime failures return non-2xx so
+  App Store Server Notifications V2 retries them. HTTP 429 is reserved for the
+  deliberately wide per-IP abuse limit (600 requests/minute).
+- **P3-2 — raw JWS retention:** `store_event_inbox.signed_payload` is currently
+  retained for idempotency/reconciliation. Before production rollout, define a
+  retention period and encrypted-at-rest archival/purge procedure; operational
+  logs must continue to exclude raw JWS and transaction identifiers.
+- **P3-3 — malformed retry operations:** the permanent/transient HTTP policy is
+  implemented above. Before production rollout, add counters/alerts for each
+  discard reason and transient failure class so verifier outages are distinct
+  from hostile malformed traffic without logging payload contents.
