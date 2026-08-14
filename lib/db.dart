@@ -35,6 +35,8 @@ class Db {
     // role: 'user' | 'admin'. disabled: 1 = khoá đăng nhập.
     _safeAddColumn('users', 'role', "TEXT NOT NULL DEFAULT 'user'");
     _safeAddColumn('users', 'disabled', 'INTEGER NOT NULL DEFAULT 0');
+    // Incremented by logout to invalidate every JWT issued before it.
+    _safeAddColumn('users', 'token_version', 'INTEGER NOT NULL DEFAULT 0');
     // Premium: premium_until = mốc hết hạn (ms epoch; 0 = không; sentinel lớn =
     // vĩnh viễn). trial_used = 1 khi đã dùng bản dùng thử 3 ngày (mỗi user 1 lần).
     _safeAddColumn('users', 'premium_until', 'INTEGER NOT NULL DEFAULT 0');
@@ -448,6 +450,12 @@ class Db {
   void setUserDisabled(int userId, bool disabled) {
     _db.execute(
         'UPDATE users SET disabled = ? WHERE id = ?', [disabled ? 1 : 0, userId]);
+  }
+
+  void revokeUserTokens(int userId) {
+    _db.execute(
+        'UPDATE users SET token_version = token_version + 1 WHERE id = ?',
+        [userId]);
   }
 
   /// Xoá tài khoản + TOÀN BỘ dữ liệu người dùng.
